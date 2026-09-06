@@ -1,0 +1,8 @@
+{
+    "name": "Better Terrain Tool",
+    "unique_id": "Moulk.BetterTerrainTool",
+    "version": "1.0.0",
+    "author": "Moulk",
+    "description": "Paint terrain textures on any number of transparent, z-ordered layers with a library of textured brushes. And also a lot of other things.",
+    "dd_version": "1.2.0.1"
+}
