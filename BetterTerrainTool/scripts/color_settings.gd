@@ -25,6 +25,8 @@
 
 var host = null
 var root := ""
+var prefix := ""            # host delegate prefix: "" (layer colours) or "grad_" (gradient colours)
+var gradient := false       # gradient variant: no Variants row, no fold toggle, no "all slots"
 var _ui_syncing := false
 var _random_icon = null
 var _reset_icon = null
@@ -65,9 +67,11 @@ const CB_NAMES = ["Normal", "Darken", "Multiply", "Color Burn", "Linear Burn", "
 	"Subtract", "Inverse Subtract", "Hue", "Saturation", "Color", "Luminosity"]
 
 
-func setup(host_, root_: String) -> void:
+func setup(host_, root_: String, prefix_ := "", gradient_ := false) -> void:
 	host = host_
 	root = root_
+	prefix = prefix_
+	gradient = gradient_
 
 
 # Public alias: a generic labelled slider+spin row bound to a target key.
@@ -77,6 +81,9 @@ func param_row(label: String, key: String, mn, mx, st, val) -> HBoxContainer:
 
 
 func build(box: VBoxContainer) -> void:
+	if gradient:
+		_build_gradient_variant(box)
+		return
 	var vrow = HBoxContainer.new()
 	var vbtn = Button.new()
 	vbtn.text = "Color Variants"
@@ -144,6 +151,20 @@ func build(box: VBoxContainer) -> void:
 	_all_check.hint_tooltip = "Adjust every slot at once, ON TOP of each slot's own settings: the sliders go back to neutral and act as a global offset. Toggling OFF keeps the result."
 	_all_check.connect("toggled", self, "_on_all_toggled")
 	_color_box.add_child(_all_check)
+	_build_color_rows(_color_box)
+	_build_reset(box, "Reset Colors", "Reset the colour adjustments of this layer.")
+
+
+# Gradient variant: the same blend mode / adjustments / tint / Levels rows,
+# always visible, editing the gradient's own colour dictionary.
+func _build_gradient_variant(box: VBoxContainer) -> void:
+	_color_box = VBoxContainer.new()
+	box.add_child(_color_box)
+	_build_color_rows(_color_box)
+	_build_reset(box, "Reset Gradient Colors", "Reset the colour adjustments of this gradient.")
+
+
+func _build_color_rows(cbox: VBoxContainer) -> void:
 	_color_ui = {}
 	var cbrow = HBoxContainer.new()
 	var cblbl = Label.new()
@@ -158,12 +179,12 @@ func build(box: VBoxContainer) -> void:
 	_color_blend_option.connect("item_selected", self, "_on_color_blend_selected")
 	_color_blend_option.connect("gui_input", self, "_on_color_blend_gui_input")
 	cbrow.add_child(_color_blend_option)
-	_color_box.add_child(cbrow)
-	_color_box.add_child(_color_row("Gamma", "gamma", 0.2, 3, 0.01, 1))
-	_color_box.add_child(_color_row("Contrast", "contrast", 0, 2, 0.01, 1))
-	_color_box.add_child(_color_row("Hue", "hue", -180, 180, 1, 0))
-	_color_box.add_child(_color_row("Saturation", "saturation", 0, 2, 0.01, 1))
-	_color_box.add_child(_color_row("Lightness", "lightness", -1, 1, 0.01, 0))
+	cbox.add_child(cbrow)
+	cbox.add_child(_color_row("Gamma", "gamma", 0.2, 3, 0.01, 1))
+	cbox.add_child(_color_row("Contrast", "contrast", 0, 2, 0.01, 1))
+	cbox.add_child(_color_row("Hue", "hue", -180, 180, 1, 0))
+	cbox.add_child(_color_row("Saturation", "saturation", 0, 2, 0.01, 1))
+	cbox.add_child(_color_row("Lightness", "lightness", -1, 1, 0.01, 0))
 	var trow = HBoxContainer.new()
 	var tlbl = Label.new()
 	tlbl.text = "Tint"
@@ -178,15 +199,18 @@ func build(box: VBoxContainer) -> void:
 	_tint_btn.connect("color_changed", self, "_on_tint_color_changed")
 	trow.add_child(_tint_btn)
 	trow.add_child(_reset_btn("_on_tint_reset"))
-	_color_box.add_child(trow)
+	cbox.add_child(trow)
 	_levels_toggle = CheckButton.new()
 	_levels_toggle.text = "Levels"
 	_levels_toggle.hint_tooltip = "Photoshop-style Levels: histogram, input black / gamma / white, output range, per channel."
 	_levels_toggle.connect("toggled", self, "_on_levels_toggle")
-	_color_box.add_child(_levels_toggle)
-	_build_levels_box(_color_box)
+	cbox.add_child(_levels_toggle)
+	_build_levels_box(cbox)
+
+
+func _build_reset(box: VBoxContainer, text: String, tip: String) -> void:
 	var reset = Button.new()
-	reset.text = "Reset Colors"
+	reset.text = text
 	reset.align = Button.ALIGN_CENTER
 	var reset_ic = _load_icon(root + "icons/reset.png", 0.75)
 	if reset_ic != null:
@@ -203,7 +227,7 @@ func build(box: VBoxContainer) -> void:
 		ricr.margin_left = -(reset_ic.get_width() + 6)
 		ricr.margin_right = -6
 		reset.add_child(ricr)
-	reset.hint_tooltip = "Reset the colour adjustments of this layer."
+	reset.hint_tooltip = tip
 	reset.connect("pressed", self, "_on_color_reset")
 	# Outside the collapsible Color Settings section, framed like the host's
 	# Fill / Clear buttons when it offers that style.
@@ -241,14 +265,14 @@ func _on_variants_all_toggled(on: bool) -> void:
 
 
 func _on_all_toggled(on: bool) -> void:
-	if not host.has_method("cs_all_targets"):
+	if not host.has_method(prefix + "cs_all_targets"):
 		return
 	if _variants_all_check != null and is_instance_valid(_variants_all_check) and _variants_all_check.pressed != on:
 		_ui_syncing = true
 		_variants_all_check.pressed = on
 		_ui_syncing = false
 	if on:
-		for t in host.cs_all_targets():
+		for t in host.call(prefix + "cs_all_targets"):
 			t["_cs_base"] = _snap(t)
 			t.erase("_cs_var")
 		_all_ui = {}
@@ -256,10 +280,10 @@ func _on_all_toggled(on: bool) -> void:
 			_all_ui[k] = host.COLOR_DEFAULTS[k]
 		_all_ui_levels = _neutral_levels()
 	else:
-		for t in host.cs_all_targets():
+		for t in host.call(prefix + "cs_all_targets"):
 			t.erase("_cs_base")
 			t.erase("_cs_var")
-		host.cs_edited(host.cs_target())
+		host.call(prefix + "cs_edited", host.call(prefix + "cs_target"))
 	sync_ui()
 
 
@@ -268,15 +292,15 @@ func _lv_mirror(primary: Dictionary) -> void:
 	for t in _edit_list():
 		if t != primary:
 			t["levels"] = primary["levels"].duplicate(true)
-			host.cs_apply(t)
-			host.cs_edited(t)
+			host.call(prefix + "cs_apply", t)
+			host.call(prefix + "cs_edited", t)
 
 
 # Layers a single-target edit applies to (multi-selection aware).
 func _edit_list() -> Array:
-	if host != null and host.has_method("cs_edit_targets"):
-		return host.cs_edit_targets()
-	var t = host.cs_target() if host != null else null
+	if host != null and host.has_method(prefix + "cs_edit_targets"):
+		return host.call(prefix + "cs_edit_targets")
+	var t = host.call(prefix + "cs_target") if host != null else null
 	return [t] if t != null else []
 
 
@@ -312,9 +336,9 @@ func _combine_lv(b: Array, u: Array) -> Array:
 
 
 func _apply_all_delta() -> void:
-	if not host.has_method("cs_all_targets"):
+	if not host.has_method(prefix + "cs_all_targets"):
 		return
-	for t in host.cs_all_targets():
+	for t in host.call(prefix + "cs_all_targets"):
 		if not t.has("_cs_base"):
 			t["_cs_base"] = _snap(t)   # slot added while the mode was on
 		var base = t["_cs_base"]
@@ -332,9 +356,9 @@ func _apply_all_delta() -> void:
 				bc = _combine_lv(bc, varo["levels_m"])
 			lv[c] = _combine_lv(bc, _all_ui_levels[c])
 		t["levels"] = lv
-		host.cs_apply(t)
-		host.cs_preview(t)
-	host.cs_edited(host.cs_target())
+		host.call(prefix + "cs_apply", t)
+		host.call(prefix + "cs_preview", t)
+	host.call(prefix + "cs_edited", host.call(prefix + "cs_target"))
 
 
 func set_open(on: bool) -> void:
@@ -354,7 +378,7 @@ func apply_colors_to_image(img: Image, target: Dictionary, include_levels := tru
 
 # Sync every widget from the current target (call on selection change).
 func sync_ui() -> void:
-	var layer = host.cs_target()
+	var layer = host.call(prefix + "cs_target")
 	if layer == null:
 		return
 	var src = layer
@@ -433,7 +457,7 @@ func _on_color_spin(v: float, key: String) -> void:
 	_set_color_param(key, v)
 
 func _set_color_param(key: String, v) -> void:
-	var layer = host.cs_target()
+	var layer = host.call(prefix + "cs_target")
 	if layer == null:
 		return
 	if _all_on() and key in EDIT_KEYS:
@@ -443,15 +467,15 @@ func _set_color_param(key: String, v) -> void:
 	for t in _edit_list():
 		if t != layer:
 			t[key] = v
-			host.cs_apply(t)
-			host.cs_edited(t)
+			host.call(prefix + "cs_apply", t)
+			host.call(prefix + "cs_edited", t)
 	layer[key] = v
-	host.cs_apply(layer)
+	host.call(prefix + "cs_apply", layer)
 	if key in EDIT_KEYS:
-		host.cs_preview(layer)
+		host.call(prefix + "cs_preview", layer)
 		if _lv_live and _levels_box != null and is_instance_valid(_levels_box) and _levels_box.visible:
 			_update_levels_histogram()
-	host.cs_edited(host.cs_target())
+	host.call(prefix + "cs_edited", host.call(prefix + "cs_target"))
 
 func _on_tint_color_changed(c: Color) -> void:
 	if _ui_syncing:
@@ -498,10 +522,10 @@ func _on_color_toggle(on: bool) -> void:
 	pass
 	if _color_box != null and is_instance_valid(_color_box):
 		_color_box.visible = on
-	host.cs_open_changed(on)
+	host.call(prefix + "cs_open_changed", on)
 
 func _on_color_reset() -> void:
-	var layer = host.cs_target()
+	var layer = host.call(prefix + "cs_target")
 	if layer == null:
 		return
 	# Only the colour settings: blend modes / smoothness / transform keep
@@ -509,7 +533,7 @@ func _on_color_reset() -> void:
 	if _all_on():
 		# Back to the exact state of the moment "all slots" was switched on:
 		# global deltas zeroed and per-slot variant offsets cleared.
-		for t in host.cs_all_targets():
+		for t in host.call(prefix + "cs_all_targets"):
 			t.erase("_cs_var")
 		for k in EDIT_KEYS:
 			_all_ui[k] = host.COLOR_DEFAULTS[k]
@@ -521,8 +545,8 @@ func _on_color_reset() -> void:
 		for k in EDIT_KEYS:
 			t[k] = host.COLOR_DEFAULTS[k]
 		t["levels"] = _neutral_levels()
-		host.cs_apply(t)
-		host.cs_edited(t)
+		host.call(prefix + "cs_apply", t)
+		host.call(prefix + "cs_edited", t)
 	sync_ui()
 
 func _on_variants_adv_toggled(on: bool) -> void:
@@ -535,23 +559,23 @@ func _on_variants_range_changed(_v: float) -> void:
 # One press = one new subtle random variation of the layer's colour settings,
 # offset from the CURRENT values (same spirit as ColourAndModifyThings).
 func _on_color_variants_pressed() -> void:
-	var primary = host.cs_target()
+	var primary = host.call(prefix + "cs_target")
 	if primary == null:
 		return
 	var r = 0.1
 	if _variants_range != null and is_instance_valid(_variants_range):
 		r = _variants_range.value / 100.0
-	if _all_on() and host.has_method("cs_all_targets"):
+	if _all_on() and host.has_method(prefix + "cs_all_targets"):
 		# Each slot rolls its OWN variation, stored as an offset inside the
 		# "all slots" state: Reset colours removes it, bases stay pristine.
-		for layer in host.cs_all_targets():
+		for layer in host.call(prefix + "cs_all_targets"):
 			layer["_cs_var"] = _variant_offsets(r)
 		_apply_all_delta()
 	else:
 		for t in _edit_list():
 			_variant_one(t, r)
-			host.cs_apply(t)
-			host.cs_edited(t)
+			host.call(prefix + "cs_apply", t)
+			host.call(prefix + "cs_edited", t)
 	sync_ui()
 
 
@@ -584,8 +608,8 @@ func _variant_one(layer: Dictionary, r: float) -> void:
 			vals[0] = nb
 			vals[1] = nw
 			layer["levels"]["on"] = true
-	host.cs_apply(layer)
-	host.cs_preview(layer)
+	host.call(prefix + "cs_apply", layer)
+	host.call(prefix + "cs_preview", layer)
 
 func _build_levels_box(box: VBoxContainer) -> void:
 	_levels_box = VBoxContainer.new()
@@ -695,7 +719,7 @@ func _mk_lv_spin(mn, mx, st, val, handler: String, binds: Array) -> SpinBox:
 func _on_lv_spin(v: float, kind: String, idx: int) -> void:
 	if _ui_syncing:
 		return
-	var layer = host.cs_target()
+	var layer = host.call(prefix + "cs_target")
 	if layer == null:
 		return
 	var vals: Array = _lv_vals()
@@ -714,8 +738,8 @@ func _on_lv_spin(v: float, kind: String, idx: int) -> void:
 	if _all_on():
 		_apply_all_delta()
 	else:
-		host.cs_apply(layer)
-		host.cs_edited(layer)
+		host.call(prefix + "cs_apply", layer)
+		host.call(prefix + "cs_edited", layer)
 		_lv_mirror(layer)
 	_lv_redraw()
 
@@ -734,7 +758,7 @@ func _lv_sync_spins() -> void:
 func _lv_vals() -> Array:
 	if _all_on():
 		return _all_ui_levels[_lv_channel]
-	var layer = host.cs_target()
+	var layer = host.call(prefix + "cs_target")
 	if layer == null:
 		return [0.0, 1.0, 1.0, 0.0, 1.0]
 	return layer["levels"][_lv_channel]
@@ -763,7 +787,7 @@ func lv_slider_draw(c: Control, kind: String) -> void:
 		c.draw_polyline(PoolVector2Array([pts[0], pts[1], pts[2], pts[0]]), Color(0, 0, 0, 0.8), 1.0)
 
 func lv_slider_input(c: Control, kind: String, event) -> void:
-	var layer = host.cs_target()
+	var layer = host.call(prefix + "cs_target")
 	if layer == null:
 		return
 	if event is InputEventMouseButton and event.button_index == BUTTON_LEFT:
@@ -774,7 +798,7 @@ func lv_slider_input(c: Control, kind: String, event) -> void:
 		else:
 			_lv_drag = -1
 			_lv_drag_ctrl = null
-			host.cs_edited(host.cs_target())
+			host.call(prefix + "cs_edited", host.call(prefix + "cs_target"))
 	elif event is InputEventMouseMotion and _lv_drag_ctrl == c and _lv_drag >= 0:
 		_lv_apply_drag(c, kind, event.position.x)
 
@@ -799,7 +823,7 @@ func _lv_nearest_handle(c: Control, kind: String, px: float) -> int:
 	return best
 
 func _lv_apply_drag(c: Control, kind: String, px: float) -> void:
-	var layer = host.cs_target()
+	var layer = host.call(prefix + "cs_target")
 	if layer == null:
 		return
 	var vals: Array = _lv_vals()
@@ -822,8 +846,8 @@ func _lv_apply_drag(c: Control, kind: String, px: float) -> void:
 	if _all_on():
 		_apply_all_delta()
 	else:
-		host.cs_apply(layer)
-		host.cs_preview(layer)
+		host.call(prefix + "cs_apply", layer)
+		host.call(prefix + "cs_preview", layer)
 		_lv_mirror(layer)
 	_lv_sync_spins()
 	c.update()
@@ -831,7 +855,7 @@ func _lv_apply_drag(c: Control, kind: String, px: float) -> void:
 func _on_levels_toggle(on: bool) -> void:
 	if _levels_box != null and is_instance_valid(_levels_box):
 		_levels_box.visible = on
-	var layer = host.cs_target()
+	var layer = host.call(prefix + "cs_target")
 	if layer == null or _ui_syncing:
 		return
 	if _all_on():
@@ -839,8 +863,8 @@ func _on_levels_toggle(on: bool) -> void:
 		_apply_all_delta()
 	else:
 		layer["levels"]["on"] = on
-		host.cs_apply(layer)
-		host.cs_edited(layer)
+		host.call(prefix + "cs_apply", layer)
+		host.call(prefix + "cs_edited", layer)
 		_lv_mirror(layer)
 	if on:
 		_update_levels_histogram()
@@ -852,7 +876,7 @@ func _on_lv_channel_selected(idx: int) -> void:
 	_lv_redraw()
 
 func _on_lv_reset() -> void:
-	var layer = host.cs_target()
+	var layer = host.call(prefix + "cs_target")
 	if layer == null:
 		return
 	if _all_on():
@@ -860,8 +884,8 @@ func _on_lv_reset() -> void:
 		_apply_all_delta()
 	else:
 		layer["levels"][_lv_channel] = [0.0, 1.0, 1.0, 0.0, 1.0]
-		host.cs_apply(layer)
-		host.cs_edited(layer)
+		host.call(prefix + "cs_apply", layer)
+		host.call(prefix + "cs_edited", layer)
 		_lv_mirror(layer)
 	_lv_redraw()
 
@@ -877,7 +901,7 @@ func _lv_redraw() -> void:
 # Histogram bins (96) of the current channel, AFTER the colour settings but
 # WITHOUT levels.
 func _lv_compute_bins(layer: Dictionary) -> Array:
-	var t = host.cs_texture(layer)
+	var t = host.call(prefix + "cs_texture", layer)
 	if t == null:
 		return []
 	var img: Image = t.get_data()
@@ -917,7 +941,7 @@ func _on_lv_live_toggled(on: bool) -> void:
 # Auto Levels: input black / white at the real histogram ends (0.1% clip
 # per side), for the current channel. Gamma and output are left alone.
 func _on_lv_auto() -> void:
-	var layer = host.cs_target()
+	var layer = host.call(prefix + "cs_target")
 	if layer == null:
 		return
 	var bins = _lv_compute_bins(layer)
@@ -949,15 +973,15 @@ func _on_lv_auto() -> void:
 	if _all_on():
 		_apply_all_delta()
 	else:
-		host.cs_apply(layer)
-		host.cs_edited(layer)
+		host.call(prefix + "cs_apply", layer)
+		host.call(prefix + "cs_edited", layer)
 		_lv_mirror(layer)
 	_lv_redraw()
 
 func _update_levels_histogram() -> void:
 	if _lv_hist_rect == null or not is_instance_valid(_lv_hist_rect):
 		return
-	var layer = host.cs_target()
+	var layer = host.call(prefix + "cs_target")
 	if layer == null:
 		return
 	var bins = _lv_compute_bins(layer)

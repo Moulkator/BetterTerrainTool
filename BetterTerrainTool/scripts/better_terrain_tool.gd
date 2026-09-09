@@ -137,6 +137,25 @@ var _ratio_slider: HSlider = null
 var _ratio_spin: SpinBox = null
 var _random_icon = null
 var _cs = null                 # reusable colour-settings UI module
+var _gcs = null                # second instance: the gradient overlay's colour settings
+var _grad_box: VBoxContainer = null
+var _grad_enable: CheckButton = null
+var _grad_preview: TextureRect = null
+var _grad_stops_ctrl: Control = null
+var _grad_stop_sel := 0            # index (in the target's stops array) of the selected stop
+var _grad_drag := -1               # stop index being dragged, or -1
+var _grad_drag_mid := -1           # midpoint (segment index, sorted order) being dragged
+var _grad_color_btn: ColorPickerButton = null
+var _grad_pos_spin: SpinBox = null
+var _grad_mid_spin: SpinBox = null
+var _grad_type_opt: OptionButton = null
+var _grad_opacity_slider: HSlider = null
+var _grad_setmap_btn: Button = null
+var _grad_pick := false            # dragging the gradient axis on the map
+var _grad_pick_down := false
+var _grad_stops_script = null
+var _grad_overlay: Node2D = null
+var _grad_overlay_script = null
 var _brush_continuous := true   # keep stamping every CONTINUOUS_INTERVAL frames while the mouse is still
 const CONTINUOUS_INTERVAL = 5
 const ROT_VARIANTS = 8           # pre-built rotated copies used for per-stamp random rotation
@@ -263,7 +282,9 @@ var _blend_icons := []
 var _transform_toggle: CheckButton = null
 var _transform_box: VBoxContainer = null
 var _transform_open := false
-var _hide_vanilla := false     # map-related: vanilla terrain + Terrain tool hidden
+var _hide_vanilla := false     # legacy map-wide flag (maps saved before per-level Hide Vanilla)
+var _levels_eager := false     # every level of the map has been attached (see _ensure_all_levels)
+var _newlevel_hooked := false  # DD's New Level window OK button connected (clone support)
 var _hide_vanilla_check: CheckButton = null
 var _color_open := false
 var _ui_syncing := false
@@ -378,6 +399,8 @@ func boot() -> void:
 	# no_cache = true, so the module hot-reloads like the impl itself
 	_cs = ResourceLoader.load(_root + "scripts/color_settings.gd", "GDScript", true).new()
 	_cs.setup(self, _root)
+	_gcs = ResourceLoader.load(_root + "scripts/color_settings.gd", "GDScript", true).new()
+	_gcs.setup(self, _root, "grad_", true)   # the gradient's own colour settings
 	_build_shader()
 	_record_script = ResourceLoader.load(_root + "scripts/better_terrain_tool_record.gd", "GDScript", true)
 	_op_record_script = ResourceLoader.load(_root + "scripts/better_terrain_tool_op_record.gd", "GDScript", true)
@@ -416,6 +439,7 @@ func shutdown() -> void:
 		if n != null and is_instance_valid(n):
 			n.queue_free()
 	_levels = {}
+	_levels_eager = false
 	_resize_cells = Vector2.ZERO
 	_map_size = Vector2.ZERO
 	if _picker_win != null and is_instance_valid(_picker_win):
@@ -452,12 +476,24 @@ func tick(_delta: float) -> void:
 		_g.Editor.add_child(wd)
 		wd.popup_centered()
 	_check_map_resize()
+	_ensure_all_levels()
 	if level != _cur_level:
 		_cur_level = level
 		_cur_level_id = int(level.get("ID"))
 		_sel_group = -1
 		_ensure_level(level)
 		_refresh_layer_list()
+		_apply_hide_vanilla()
+	elif int(level.get("ID")) != _cur_level_id:
+		# DD renumbers levels when one is inserted / removed: follow it.
+		_rekey_levels()
+		_cur_level_id = int(level.get("ID"))
+	if _frame_i % 15 == 0:
+		_sync_hide_vanilla_ui()
+	if _grad_pick or (_grad_overlay != null and is_instance_valid(_grad_overlay) and _grad_overlay.visible):
+		_grad_overlay_update()   # follows zoom / tool switches
+	if _frame_i % 30 == 0:
+		_refresh_clone_targets()
 	if _prefs_dirty_at >= 0 and OS.get_ticks_msec() - _prefs_dirty_at > 600:
 		_prefs_dirty_at = -1
 		_save_brush_prefs()
@@ -469,7 +505,7 @@ func tick(_delta: float) -> void:
 				_move_off = msp - _move_start
 				for l in _move_targets():
 					_move_set_off(l, _move_off)
-		if Input.is_action_just_pressed("ui_cancel"):
+		if Input.is_action_just_pressed("ui_cancel") and not _typing():
 			_move_cancel()
 	if _paint_mode == PAINT_DRAW and _tool_active:
 		var dui = _g.get("WorldUI")
@@ -480,15 +516,15 @@ func tick(_delta: float) -> void:
 					if sp2 is Vector2:
 						dui.call("SetSelectionBox", _shape_box(_shape_end_point(sp2)))
 						dui.set("IsSelectionEllipse", _shape_sub == 1)
-					if Input.is_action_just_pressed("ui_cancel"):
+					if Input.is_action_just_pressed("ui_cancel") and not _typing():
 						_draw_cancel_shape(dui)
 				# DD's inverted (blue) cursor colours while removing.
 				dui.set("IsActionInverted", _shape_neg)
 				isDrawing = false
 			else:
-				if Input.is_action_just_pressed("delete"):
+				if Input.is_action_just_pressed("delete") and not _typing():
 					dui.call("UndoPolyPoint")
-				if Input.is_action_just_pressed("ui_cancel"):
+				if Input.is_action_just_pressed("ui_cancel") and not _typing():
 					dui.call("ClearPolyline")
 					dui.set("EditArcPoint", false)
 					_draw_pending_end = false
@@ -627,6 +663,8 @@ func on_content_input(event) -> void:
 	# DD only routes canvas input to the active tool, so no _tool_active gate
 	# here (the enable callback may not reach this object on every DD build).
 	# Right click is NOT routed here by DD -> handled by our own listener.
+	if _grad_pick and _grad_pick_input(event):
+		return
 	if event is InputEventMouseButton:
 		if event.button_index == BUTTON_LEFT and _paint_mode == PAINT_MOVE:
 			_move_click(event)
@@ -665,7 +703,7 @@ func on_content_input(event) -> void:
 				if Input.is_key_pressed(KEY_Z) and not event.control:
 					step = 1.0 if event.shift else 5.0
 				_rot_delta(-step * dir)
-	elif event is InputEventKey and event.pressed and not event.echo:
+	elif event is InputEventKey and event.pressed and not event.echo and not _typing():
 		if event.scancode == KEY_BRACKETRIGHT:
 			_size_delta(1)
 		elif event.scancode == KEY_BRACKETLEFT:
@@ -1078,14 +1116,67 @@ func _install_input_listener() -> void:
 		_g.World.call_deferred("add_child", _input_listener)
 
 
+# True while a text box (LineEdit, TextEdit, a SpinBox's editor...) has the
+# keyboard focus: keyboard shortcuts must not fire then.
+func _typing() -> bool:
+	if _g == null or _g.Editor == null or not is_instance_valid(_g.Editor):
+		return false
+	# Flag raised by every text box of this mod (and by the other mods'
+	# search bars): DD reads it too before firing its own shortcuts.
+	if _g.Editor.get("SearchHasFocus"):
+		return true
+	# DD's own focus tracking, more reliable than the viewport's focus owner
+	# for controls hosted in its panels.
+	var focus = null
+	if _g.Editor.has_method("GetFocus"):
+		focus = _g.Editor.GetFocus()
+	if focus == null:
+		focus = _g.Editor.get_focus_owner()
+	return focus != null and (focus is LineEdit or focus is TextEdit or focus is SpinBox)
+
+
+# Make a text input shortcut-safe: while it has the focus, DD's
+# SearchHasFocus flag is raised, so neither this mod's nor Dungeondraft's
+# keyboard shortcuts fire. SpinBoxes are guarded through their line edit.
+func _guard_text_input(ctrl: Control) -> void:
+	if ctrl == null or not is_instance_valid(ctrl):
+		return
+	var le = ctrl.get_line_edit() if ctrl is SpinBox else ctrl
+	if le == null or le.has_meta("btt_guarded"):
+		return
+	le.set_meta("btt_guarded", true)
+	le.connect("focus_entered", self, "_on_text_focus", [true])
+	le.connect("focus_exited", self, "_on_text_focus", [false])
+
+
+func _on_text_focus(entered: bool) -> void:
+	if _g != null and _g.Editor != null and is_instance_valid(_g.Editor):
+		_g.Editor.set("SearchHasFocus", entered)
+
+
+# Guard every LineEdit / SpinBox under a node (panels are built once).
+func _guard_text_inputs_in(root: Node) -> void:
+	if root == null or not is_instance_valid(root):
+		return
+	var stack = [root]
+	while not stack.empty():
+		var n = stack.pop_back()
+		if n is LineEdit or n is SpinBox:
+			_guard_text_input(n)
+		for c in n.get_children():
+			stack.push_back(c)
+
+
 func _on_raw_input(event) -> void:
 	if _shutdown:
+		return
+	# Every keyboard shortcut below is ignored while typing in a text box.
+	if event is InputEventKey and _typing():
 		return
 	# Tool shortcut (bindable in Preferences -> Shortcuts through _Lib, or via
 	# the Minor Utils settings row): switch to the Better Terrain Tool.
 	if event is InputEventKey and event.pressed and not event.echo:
-		var focus = _g.Editor.get_focus_owner() if _g.Editor != null else null
-		var typing = focus != null and (focus is LineEdit or focus is TextEdit)
+		var typing = false
 		if not typing:
 			if InputMap.has_action(TOOL_ID) and InputMap.event_is_action(event, TOOL_ID):
 				_g.Editor.Toolset.Quickswitch(TOOL_ID)
@@ -1274,7 +1365,59 @@ func _woxels() -> Vector2:
 	return w if w is Vector2 else Vector2.ZERO
 
 
+# DD keeps a stable runtime Level.ID but SAVES the levels by position
+# (World.SaveLevels writes AllLevels[i] under key i, and a new level is
+# inserted at position 0), so the runtime ID and the saved key differ as
+# soon as a level is added or reordered. The embed is therefore keyed by
+# POSITION, computed live at persist / load time.
+func _all_levels() -> Array:
+	if _g == null or _g.World == null or not is_instance_valid(_g.World):
+		return []
+	var a = _g.World.call("get_AllLevels") if _g.World.has_method("get_AllLevels") else _g.World.get("Levels")
+	var out := []
+	if a != null:
+		for l in a:
+			out.append(l)
+	return out
+
+
+func _level_pos(level) -> int:
+	if level == null or not is_instance_valid(level):
+		return -1
+	return _all_levels().find(level)
+
+
+# Drop entries whose level was deleted.
+func _rekey_levels() -> void:
+	var fresh := {}
+	for lid in _levels.keys():
+		var e = _levels[lid]
+		var lvl = e.get("level")
+		if lvl == null or not is_instance_valid(lvl):
+			var n = e.get("node")
+			if n != null and is_instance_valid(n):
+				n.queue_free()
+			continue
+		fresh[int(lvl.get("ID"))] = e
+	_levels = fresh
+
+
+# Attach every level of the map as soon as it is available, so no level's
+# data is still keyed by a stale ID in the embed when DD renumbers them.
+func _ensure_all_levels() -> void:
+	if _levels_eager or _g == null or _g.World == null or not is_instance_valid(_g.World):
+		return
+	var lvls = _all_levels()
+	if lvls.empty():
+		return
+	for lvl in lvls:
+		if lvl != null and is_instance_valid(lvl):
+			_ensure_level(lvl)
+	_levels_eager = true
+
+
 func _ensure_level(level) -> Dictionary:
+	_rekey_levels()
 	var lid = int(level.get("ID"))
 	if _levels.has(lid):
 		var e = _levels[lid]
@@ -1284,16 +1427,21 @@ func _ensure_level(level) -> Dictionary:
 	container.name = "BetterTerrainLayers"
 	container.z_as_relative = true
 	level.add_child(container)
-	var entry := {"layers": [], "node": container, "level": level}
-	if _hide_vanilla:
-		call_deferred("_apply_hide_vanilla")   # cover levels created after the toggle
+	var entry := {"layers": [], "node": container, "level": level, "hide_vanilla": false, "hide_mode": "full"}
 	var lts = level.get("Lights")
 	if lts != null:
 		for c in lts.get_children():
 			if str(c.name).begins_with("BTT_Light_"):
 				c.queue_free()
 	_levels[lid] = entry
-	_load_level_from_embed(lid, entry)
+	# Embed data is read by saved position. Once every level is attached, a
+	# level showing up later is a NEW one (created or cloned): the embed
+	# holds nothing for it, and its position 0 would even alias another
+	# level's data.
+	if not _levels_eager:
+		_load_level_from_embed(_level_pos(level), entry)
+	else:
+		_schedule_persist()
 	return entry
 
 
@@ -1439,6 +1587,7 @@ func _apply_color_params(layer: Dictionary, mat: ShaderMaterial) -> void:
 			_apply_color_params(layer, lm)
 			lm.set_shader_param("color_blend", 0.0)
 	mat.set_shader_param("opaque", 1.0 if _texture_is_opaque(str(layer["tex"])) else 0.0)
+	_push_grad(mat, "", layer.get("grad"))
 	mat.set_shader_param("hue", float(layer["hue"]))
 	mat.set_shader_param("saturation", float(layer["saturation"]))
 	mat.set_shader_param("lightness", float(layer["lightness"]))
@@ -1938,6 +2087,184 @@ func _upload_mask_rect(layer: Dictionary, r: Rect2) -> void:
 
 # ── Colour-settings module host contract ─────────────────────────────────────
 
+# ── Gradient overlay ────────────────────────────────────────────────────────
+# Photoshop-style "Gradient Overlay" on a layer or a group: colour stops
+# (with alpha and a per-segment midpoint), a map-space axis p0 -> p1 set by
+# dragging on the map, linear / radial / reflected, optional repeat, a
+# global opacity, and its OWN colour settings (blend mode, adjustments,
+# tint, Levels) applied to the gradient colours only. The stops are baked
+# into a 256x1 LUT sampled by the shader.
+const GRAD_LUT_W = 256
+const GRAD_DEFAULTS = {"on": false, "type": 0, "p0x": 0.0, "p0y": 0.0, "p1x": 1024.0, "p1y": 0.0,
+	"repeat": false, "opacity": 1.0,
+	"stops": [{"pos": 0.0, "color": "ff000000", "mid": 0.5}, {"pos": 1.0, "color": "ffffffff", "mid": 0.5}]}   # ARGB html (Godot 3)
+
+
+# The gradient dictionary of a layer / group, created (and completed) on demand.
+func _grad_of(t: Dictionary) -> Dictionary:
+	var gd = t.get("grad")
+	if not (gd is Dictionary):
+		gd = {}
+		t["grad"] = gd
+	for k in GRAD_DEFAULTS.keys():
+		if not gd.has(k):
+			gd[k] = _cv(GRAD_DEFAULTS[k])
+	for k in COLOR_DEFAULTS.keys():
+		if k in ["tex_rot", "tex_scale", "tex_off_x", "tex_off_y"]:
+			continue
+		if not gd.has(k):
+			gd[k] = _cv(COLOR_DEFAULTS[k])
+	return gd
+
+
+# Serialisable copy (drops the cached LUT and other "_" runtime keys).
+func _grad_ser(gd) -> Dictionary:
+	if not (gd is Dictionary):
+		return {}
+	var out := {}
+	for k in gd.keys():
+		if not str(k).begins_with("_"):
+			out[k] = _cv(gd[k])
+	return out
+
+
+func _grad_sorted_stops(gd: Dictionary) -> Array:
+	var st = gd["stops"].duplicate()
+	st.sort_custom(self, "_sort_stop_pos")
+	return st
+
+
+func _sort_stop_pos(a, b) -> bool:
+	return float(a["pos"]) < float(b["pos"])
+
+
+# Colour of the gradient at t (0..1), before its colour settings.
+func _grad_eval(stops: Array, t: float) -> Color:
+	if stops.empty():
+		return Color(1, 1, 1, 1)
+	if t <= float(stops[0]["pos"]):
+		return Color(str(stops[0]["color"]))
+	var last = stops[stops.size() - 1]
+	if t >= float(last["pos"]):
+		return Color(str(last["color"]))
+	for i in range(stops.size() - 1):
+		var a = stops[i]
+		var b = stops[i + 1]
+		var pa = float(a["pos"])
+		var pb = float(b["pos"])
+		if t >= pa and t <= pb:
+			var u = 0.0 if pb <= pa else (t - pa) / (pb - pa)
+			# Photoshop midpoint: where the 50% mix sits inside the segment.
+			var mid = clamp(float(a.get("mid", 0.5)), 0.02, 0.98)
+			u = (0.5 * u / mid) if u < mid else (0.5 + 0.5 * (u - mid) / (1.0 - mid))
+			return Color(str(a["color"])).linear_interpolate(Color(str(b["color"])), clamp(u, 0.0, 1.0))
+	return Color(str(last["color"]))
+
+
+# Raw LUT image (no colour settings): histogram source and preview base.
+func _grad_lut_image(gd: Dictionary) -> Image:
+	var stops = _grad_sorted_stops(gd)
+	var img = Image.new()
+	img.create(GRAD_LUT_W, 1, false, Image.FORMAT_RGBA8)
+	img.lock()
+	for x in range(GRAD_LUT_W):
+		img.set_pixel(x, 0, _grad_eval(stops, float(x) / float(GRAD_LUT_W - 1)))
+	img.unlock()
+	return img
+
+
+# Final LUT texture (colour settings applied), cached on the dictionary.
+func _grad_lut(gd: Dictionary) -> ImageTexture:
+	var img = _grad_lut_image(gd)
+	if _gcs != null:
+		_gcs.apply_colors_to_image(img, gd, true)
+	var t = gd.get("_lut")
+	if t == null or not (t is ImageTexture):
+		t = ImageTexture.new()
+		gd["_lut"] = t
+	t.create_from_image(img, Texture.FLAG_FILTER)
+	return t
+
+
+# Push a gradient's uniforms (prefix "" for the layer, "grp_" for the group).
+func _push_grad(mat: ShaderMaterial, pre: String, gd) -> void:
+	if mat == null or not is_instance_valid(mat):
+		return
+	if not (gd is Dictionary) or not bool(gd.get("on", false)):
+		mat.set_shader_param(pre + "grad_on", 0.0)
+		return
+	var lut = gd.get("_lut")
+	if lut == null:
+		lut = _grad_lut(gd)
+	mat.set_shader_param(pre + "grad_on", 1.0)
+	mat.set_shader_param(pre + "grad_tex", lut)
+	mat.set_shader_param(pre + "grad_type", float(int(gd["type"])))
+	mat.set_shader_param(pre + "grad_p0", Vector2(float(gd["p0x"]), float(gd["p0y"])))
+	mat.set_shader_param(pre + "grad_p1", Vector2(float(gd["p1x"]), float(gd["p1y"])))
+	mat.set_shader_param(pre + "grad_repeat", 1.0 if bool(gd["repeat"]) else 0.0)
+	mat.set_shader_param(pre + "grad_opacity", float(gd["opacity"]))
+	mat.set_shader_param(pre + "grad_blend", float(int(gd["color_blend"])))
+
+
+# Owner (layer or group of the current level) of a gradient dictionary.
+func _grad_owner(gd: Dictionary):
+	for l in _cur_layers():
+		if l.get("grad") == gd:
+			return l
+	for g in _cur_groups():
+		if g.get("grad") == gd:
+			return g
+	return null
+
+
+func _grad_refresh(gd: Dictionary) -> void:
+	_grad_lut(gd)
+	var owner = _grad_owner(gd)
+	if owner == null:
+		return
+	if bool(owner.get("grp", false)):
+		_grp_push_params(owner)
+	else:
+		_apply_color_params(owner, owner["mat"])
+	_sync_grad_preview()
+	_grad_overlay_update()
+
+
+# Host delegate for the gradient colour-settings module (prefix "grad_").
+func grad_cs_target():
+	var t = cs_target()
+	return _grad_of(t) if t != null else null
+
+
+func grad_cs_edit_targets() -> Array:
+	var out := []
+	for t in cs_edit_targets():
+		out.append(_grad_of(t))
+	return out
+
+
+func grad_cs_apply(target: Dictionary) -> void:
+	_grad_refresh(target)
+
+
+func grad_cs_preview(_target) -> void:
+	pass
+
+
+func grad_cs_edited(_target) -> void:
+	_persist()
+
+
+func grad_cs_texture(target: Dictionary):
+	var t = ImageTexture.new()
+	t.create_from_image(_grad_lut_image(target), Texture.FLAG_FILTER)
+	return t
+
+
+func grad_cs_open_changed(_on: bool) -> void:
+	pass
+
+
 func cs_target():
 	var g = _sel_grp()
 	if g != null:
@@ -2005,7 +2332,7 @@ func _build_shader() -> void:
 	if f.open(_root + "shaders/terrain_layer.shader", File.READ) == OK:
 		_shader.code = f.get_as_text()
 		f.close()
-		_shader_outdated = not ("BTT_GRP_V3" in _shader.code)
+		_shader_outdated = not ("BTT_GRP_V4" in _shader.code)
 		if _shader_outdated:
 			printerr("[BetterTerrain] shaders/terrain_layer.shader is OUTDATED. Layer groups will not render -- copy the shader file shipped with this version of the mod.")
 	else:
@@ -3495,6 +3822,10 @@ func _stamp_max(img: Image, at: Vector2) -> void:
 #    colour settings, no painted data) ─────────────────────────────────────
 const PRESETS_PATH = "user://BetterTerrainTool/presets.json"
 var _preset_dropdown: OptionButton = null
+var _clone_row: HBoxContainer = null
+var _clone_target_opt: OptionButton = null
+var _clone_confirm: ConfirmationDialog = null
+var _clone_sig := []
 var _preset_name_edit: LineEdit = null
 var _paste_btn: Button = null
 var _clipboard := []
@@ -3526,6 +3857,7 @@ func _build_presets_ui(align) -> void:
 	align.add_child(_rm(prow))
 	var srow = HBoxContainer.new()
 	_preset_name_edit = LineEdit.new()
+	_guard_text_input(_preset_name_edit)
 	_preset_name_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_preset_name_edit.placeholder_text = "Preset name"
 	srow.add_child(_preset_name_edit)
@@ -3536,6 +3868,93 @@ func _build_presets_ui(align) -> void:
 	srow.add_child(save_btn)
 	align.add_child(_rm(srow))
 	_refresh_preset_dropdown()
+	# ── Clone terrain on another level (shown when the map has 2+ levels) ──
+	_clone_row = HBoxContainer.new()
+	var clbl = Label.new()
+	clbl.text = "Clone terrain on:"
+	_clone_row.add_child(clbl)
+	_clone_target_opt = OptionButton.new()
+	_clone_target_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_clone_target_opt.hint_tooltip = "Copy this level's terrain layers, groups and paint onto the chosen level (replacing its terrain layers)."
+	_clone_row.add_child(_clone_target_opt)
+	var cok = _mk_btn("OK", "_on_clone_terrain_pressed")
+	cok.size_flags_horizontal = 0
+	_clone_row.add_child(_framed(cok))
+	_clone_row.visible = false
+	align.add_child(_rm(_clone_row))
+	_refresh_clone_targets()
+
+
+# Other levels of the map as clone targets; hidden on single-level maps.
+func _refresh_clone_targets() -> void:
+	if _clone_target_opt == null or not is_instance_valid(_clone_target_opt):
+		return
+	var all = _all_levels()
+	var cur = _current_level()
+	var others := []
+	for l in all:
+		if l != null and is_instance_valid(l) and l != cur:
+			others.append(l)
+	_clone_row.visible = not others.empty()
+	if others.empty():
+		return
+	# Rebuild only when the list actually changed (a periodic rebuild would
+	# close the dropdown while it is open).
+	var sig := []
+	for l in others:
+		sig.append(str(l.get("ID")) + ":" + str(l.get("Label")))
+	if sig == _clone_sig:
+		return
+	_clone_sig = sig
+	var keep = _clone_target_opt.get_selected_id() if _clone_target_opt.get_item_count() > 0 else -1
+	_clone_target_opt.clear()
+	for l in others:
+		_clone_target_opt.add_item(str(l.get("Label")), int(l.get("ID")))
+	var ki = _clone_target_opt.get_item_index(keep) if keep >= 0 else -1
+	_clone_target_opt.select(ki if ki >= 0 else 0)
+
+
+func _on_clone_terrain_pressed() -> void:
+	if _clone_target_opt == null or _clone_target_opt.get_item_count() == 0:
+		return
+	var tid = _clone_target_opt.get_selected_id()
+	var target = null
+	for l in _all_levels():
+		if l != null and is_instance_valid(l) and int(l.get("ID")) == tid:
+			target = l
+			break
+	var src = _cur_entry()
+	if target == null or src == null:
+		return
+	var dst = _ensure_level(target)
+	if dst["layers"].empty() and dst.get("groups", []).empty():
+		_do_clone_terrain(tid)
+		return
+	if _clone_confirm == null or not is_instance_valid(_clone_confirm):
+		_clone_confirm = ConfirmationDialog.new()
+		_clone_confirm.window_title = "Clone terrain"
+		_clone_confirm.get_ok().text = "Replace"
+		_g.Editor.add_child(_clone_confirm)
+	if _clone_confirm.is_connected("confirmed", self, "_do_clone_terrain"):
+		_clone_confirm.disconnect("confirmed", self, "_do_clone_terrain")
+	_clone_confirm.connect("confirmed", self, "_do_clone_terrain", [tid])
+	_clone_confirm.dialog_text = "The level \"%s\" already has %d terrain layer(s).\nReplace them with a copy of this level's terrain? (This cannot be undone.)" % [str(target.get("Label")), dst["layers"].size()]
+	_clone_confirm.popup_centered()
+
+
+func _do_clone_terrain(tid: int) -> void:
+	var src = _cur_entry()
+	var dst = _levels.get(tid)
+	if src == null or dst == null or src == dst:
+		return
+	# Wipe the target's terrain first (layers, groups, their nodes).
+	while not dst["layers"].empty():
+		_remove_layer(dst, dst["layers"].size() - 1)
+	for g in dst.get("groups", []):
+		_grp_free_clip(g)
+	dst["groups"] = []
+	_clone_level_data(src, dst)
+	print("[BetterTerrain] cloned %d terrain layer(s) to level \"%s\"" % [src["layers"].size(), str(dst["level"].get("Label"))])
 
 
 func _palette_of_current() -> Array:
@@ -3545,6 +3964,8 @@ func _palette_of_current() -> Array:
 			"z": int(l["z"]), "opacity": float(l["opacity"]), "res": int(l["res"]), "cb2": true}
 		for k in COLOR_KEYS:
 			d[k] = _cv(l[k])
+		if l.get("grad") is Dictionary:
+			d["grad"] = _grad_ser(l["grad"])
 		out.append(d)
 	return out
 
@@ -3566,6 +3987,9 @@ func _add_palette(items: Array) -> void:
 			layer["blend"] = 2   # legacy field
 		if not bool(d.get("cb2", false)):
 			layer["color_blend"] = _migrate_cb(int(layer["color_blend"]))
+		if d.get("grad") is Dictionary:
+			layer["grad"] = d["grad"].duplicate(true)
+			_grad_of(layer)
 		_apply_color_params(layer, layer["mat"])
 		last = layer
 	if last != null:
@@ -4112,6 +4536,7 @@ func _serialize_layer(layer: Dictionary) -> Dictionary:
 	d["clip_z"] = layer.get("clip_z")
 	d["clip_obj"] = layer.get("clip_obj")
 	d["gen"] = layer.get("gen")
+	d["grad"] = _grad_ser(layer.get("grad")) if layer.get("grad") is Dictionary else null
 	return d
 
 
@@ -4132,6 +4557,9 @@ func _restore_layer(level_id: int, d: Dictionary) -> void:
 	layer["clip_z"] = d.get("clip_z")
 	layer["clip_obj"] = d.get("clip_obj")
 	layer["gen"] = d.get("gen") if d.get("gen") is Dictionary else null
+	if d.get("grad") is Dictionary:
+		layer["grad"] = d["grad"].duplicate(true)
+		_grad_of(layer)
 	_light_update(entry, layer)
 	_clip_update(entry, layer)
 	_apply_color_params(layer, layer["mat"])
@@ -4298,8 +4726,113 @@ func _fit_mask(old: Image, w: int, h: int, res: int, shift_px: Vector2, fill: Co
 	return img
 
 
+# DD's New Level window: when a level is cloned, DD copies its own data
+# only (Level.Save/Load), so the terrain layers are copied here. The C#
+# handler runs first (the new level already exists, inserted at position 0).
+func _hook_newlevel_dialog() -> void:
+	if _newlevel_hooked or _g == null or _g.Editor == null:
+		return
+	var wins = _g.Editor.get_node_or_null("Windows")
+	if wins == null:
+		return
+	var dlg = null
+	for c in wins.get_children():
+		var scr = c.get_script()
+		if scr != null and "NewLevelWindow" in str(scr.resource_path):
+			dlg = c
+			break
+	if dlg == null:
+		return
+	var ok = dlg.find_node("OkayButton", true, false)
+	if ok == null:
+		return
+	ok.connect("pressed", self, "_on_newlevel_ok_pressed", [dlg])
+	_newlevel_hooked = true
+
+
+func _find_first_of(root: Node, cls: String):
+	var stack = [root]
+	while not stack.empty():
+		var n = stack.pop_back()
+		if n.is_class(cls):
+			return n
+		for c in n.get_children():
+			stack.push_back(c)
+	return null
+
+
+func _on_newlevel_ok_pressed(dlg) -> void:
+	var opt = _find_first_of(dlg, "OptionButton")
+	if opt == null or int(opt.selected) <= 0:
+		return   # plain new level: nothing to copy
+	var all = _all_levels()
+	var le = _find_first_of(dlg, "LineEdit")
+	var label = str(le.text) if le != null else ""
+	# The clone is the level we do not know yet (DD inserts it at position 0).
+	var clone = null
+	for l in all:
+		if l != null and is_instance_valid(l) and not _levels.has(int(l.get("ID"))):
+			clone = l
+			break
+	if clone == null:
+		print("[BetterTerrain] clone level: new level not found")
+		return
+	# The dropdown listed the levels BEFORE the insertion: index it on the
+	# list without the clone.
+	var before := []
+	for l in all:
+		if l != clone:
+			before.append(l)
+	var si = int(opt.selected) - 1
+	if si < 0 or si >= before.size():
+		return
+	var src = before[si]
+	var src_entry = _levels.get(int(src.get("ID")))
+	var dst_entry = _ensure_level(clone)
+	if src_entry == null:
+		return
+	_clone_level_data(src_entry, dst_entry)
+	print("[BetterTerrain] cloned %d terrain layer(s) to level \"%s\"" % [src_entry["layers"].size(), label])
+
+
+func _clone_level_data(src: Dictionary, dst: Dictionary) -> void:
+	var dst_lid = int(dst["level"].get("ID"))
+	var uid_map := {}
+	for layer in src["layers"]:
+		var d = _serialize_layer(layer)
+		uid_map[int(layer["uid"])] = _next_uid
+		d["uid"] = _next_uid
+		_next_uid += 1
+		d["clip_obj"] = null   # object node ids differ on the clone
+		_restore_layer(dst_lid, d)
+	var groups := []
+	for g in src.get("groups", []):
+		var gd = _ser_group(g)
+		gd["uid"] = _next_group_uid
+		_next_group_uid += 1
+		var members := []
+		for m in gd["members"]:
+			if uid_map.has(int(m)):
+				members.append(uid_map[int(m)])
+		gd["members"] = members
+		gd["clip_obj"] = null
+		gd["clip_vp"] = null
+		_grp_runtime(gd)
+		groups.append(gd)
+	dst["groups"] = groups
+	dst["hide_vanilla"] = bool(src.get("hide_vanilla", false))
+	dst["hide_mode"] = str(src.get("hide_mode", "full"))
+	if src.has("vanilla_was_visible"):
+		dst["vanilla_was_visible"] = src["vanilla_was_visible"]
+	_groups_sync_shaders(dst)
+	_clip_refresh_all(dst)
+	_apply_hide_vanilla()
+	_schedule_persist()
+
+
 func _check_map_resize() -> void:
 	_hook_resize_dialog()
+	_hook_newlevel_dialog()
 	var wx = _woxels()
 	if wx == Vector2.ZERO:
 		return
@@ -4411,7 +4944,14 @@ func _persist() -> void:
 	var levels = data.get("levels", {})
 	if not (levels is Dictionary):
 		levels = {}
+	_rekey_levels()
+	var all = _all_levels()
+	if _levels_eager and _levels.size() >= all.size():
+		levels = {}   # every level is attached: rebuild by live position only
 	for lid in _levels.keys():
+		var pos = _level_pos(_levels[lid].get("level"))
+		if pos < 0:
+			continue
 		var arr := []
 		for layer in _levels[lid]["layers"]:
 			arr.append({
@@ -4430,6 +4970,7 @@ func _persist() -> void:
 				"clip_z": layer.get("clip_z"),
 				"clip_obj": layer.get("clip_obj"),
 				"gen": layer.get("gen"),
+				"grad": _grad_ser(layer.get("grad")) if layer.get("grad") is Dictionary else null,
 				"res": int(layer["res"]), "w": layer["mask"].get_width(),
 				"h": layer["mask"].get_height(), "mask": layer["b64"],
 			})
@@ -4441,16 +4982,19 @@ func _persist() -> void:
 				"smoothness": float(g.get("smoothness", 1536.0)), "res": int(g.get("res", DEFAULT_RES))}
 			for ck in GRP_CS_KEYS:
 				if g.has(ck):
-					gd[ck] = g[ck].duplicate(true) if g[ck] is Dictionary else g[ck]
+					gd[ck] = _grad_ser(g[ck]) if ck == "grad" else g[ck].duplicate(true) if g[ck] is Dictionary else g[ck]
 			if g.get("mask") is Image:
 				gd["w"] = g["mask"].get_width()
 				gd["h"] = g["mask"].get_height()
 				gd["mask"] = str(g.get("b64", ""))
 			garr.append(gd)
-		levels[str(lid)] = {"layers": arr, "groups": garr}
+		var ent = _levels[lid]
+		levels[str(pos)] = {"layers": arr, "groups": garr,
+			"hide_vanilla": bool(ent.get("hide_vanilla", false)), "hide_mode": str(ent.get("hide_mode", "full")),
+			"vanilla_was_visible": ent.get("vanilla_was_visible")}
 	data["v"] = 3   # v2: coverage moved to red; v3: reordered color_blend list
 	data["levels"] = levels
-	data["hide_vanilla"] = _hide_vanilla
+	data.erase("hide_vanilla")   # legacy map-wide flag, now per level
 	mmd[EMBED_KEY] = data
 
 
@@ -4486,18 +5030,22 @@ func _load_level_from_embed(lid: int, entry: Dictionary) -> void:
 		return
 	if data.has("hide_vanilla"):
 		_hide_vanilla = bool(data.get("hide_vanilla", false))
-		if _hide_vanilla_check != null and is_instance_valid(_hide_vanilla_check):
-			_ui_syncing = true
-			_hide_vanilla_check.pressed = _hide_vanilla
-			_ui_syncing = false
-		call_deferred("_apply_hide_vanilla")
 	var legacy_alpha = int(data.get("v", 1)) < 2
 	var levels = data.get("levels", {})
 	if not (levels is Dictionary):
 		return
 	var ld = levels.get(str(lid))
 	if not (ld is Dictionary):
+		if _hide_vanilla:
+			entry["hide_vanilla"] = true   # legacy map-wide flag
+			call_deferred("_apply_hide_vanilla")
 		return
+	entry["hide_vanilla"] = bool(ld.get("hide_vanilla", _hide_vanilla))
+	entry["hide_mode"] = str(ld.get("hide_mode", "full"))
+	if ld.get("vanilla_was_visible") != null:
+		entry["vanilla_was_visible"] = bool(ld["vanilla_was_visible"])
+	if entry["hide_vanilla"]:
+		call_deferred("_apply_hide_vanilla")
 	var arr = ld.get("layers", [])
 	if not (arr is Array):
 		return
@@ -4556,6 +5104,9 @@ func _load_level_from_embed(lid: int, entry: Dictionary) -> void:
 		layer["clip_z"] = d.get("clip_z")
 		layer["clip_obj"] = d.get("clip_obj")
 		layer["gen"] = d.get("gen") if d.get("gen") is Dictionary else null
+		if d.get("grad") is Dictionary:
+			layer["grad"] = d["grad"]
+			_grad_of(layer)
 		_light_update(entry, layer)
 		_clip_update(entry, layer)
 		_apply_color_params(layer, layer["mat"])
@@ -4911,6 +5462,8 @@ func _register_tool() -> void:
 	_cs.build(_props_box)
 	_cs.set_open(_color_open)
 	_props_box.add_child(_sep())
+	_build_gradient_ui(_props_box)
+	_props_box.add_child(_sep())
 	_transform_toggle = CheckButton.new()
 	_transform_toggle.text = "Transform"
 	_transform_toggle.align = Button.ALIGN_CENTER
@@ -4932,7 +5485,7 @@ func _register_tool() -> void:
 	_hide_vanilla_check = CheckButton.new()
 	_hide_vanilla_check.text = "Hide Vanilla Terrain"
 	_hide_vanilla_check.align = Button.ALIGN_CENTER
-	_hide_vanilla_check.hint_tooltip = "Hides Dungeondraft's own terrain on every level, plus its Terrain tool (saved with the map)."
+	_hide_vanilla_check.hint_tooltip = "Hides Dungeondraft's own terrain on THIS level, plus its Terrain tool (saved with the map, per level). When the vanilla terrain is already disabled, only the tool is hidden."
 	_hide_vanilla_check.connect("toggled", self, "_on_hide_vanilla_toggled")
 	_props_box.add_child(_hide_vanilla_check)
 	_tool_panel.EndSection()
@@ -4965,6 +5518,9 @@ func _register_tool() -> void:
 	_tool_panel.EndSection()
 
 	_build_right_panel()
+	# Every text box of both panels raises DD's SearchHasFocus while focused.
+	_guard_text_inputs_in(_tool_panel)
+	_guard_text_inputs_in(_right_panel)
 	_sync_props()
 
 
@@ -5428,43 +5984,84 @@ func _on_smooth_link_toggled(on: bool) -> void:
 func _on_hide_vanilla_toggled(on: bool) -> void:
 	if _ui_syncing:
 		return
-	_hide_vanilla = on
+	var entry = _cur_entry()
+	if entry == null:
+		return
+	if on:
+		# Vanilla terrain already disabled by its own tool: only hide the tool.
+		var terrain = _vanilla_terrain(entry)
+		entry["hide_mode"] = "tool" if (terrain != null and not terrain.visible) else "full"
+	entry["hide_vanilla"] = on
 	_apply_hide_vanilla()
 	_schedule_persist()
 
 
-# Hide / show DD's own terrain (every level) and its Terrain toolbar button.
-# The terrain is both hidden AND disabled (the Terrain tool's Enabled
-# setting), like unchecking Enable in the vanilla tool.
+func _vanilla_terrain(entry: Dictionary):
+	var lvl = entry.get("level")
+	if lvl == null or not is_instance_valid(lvl):
+		return null
+	var t = lvl.get("Terrain")
+	return t if (t != null and is_instance_valid(t)) else null
+
+
+# Apply every level's own Hide Vanilla flag: in "full" mode DD's terrain of
+# that level is hidden (its previous visibility remembered for the way
+# back); in "tool" mode the terrain was already disabled by the vanilla
+# tool and is left alone. The vanilla Terrain toolbar button follows the
+# CURRENT level's flag. Levels without the flag are never touched (a new
+# level keeps whatever DD gave it).
 func _apply_hide_vanilla() -> void:
 	if _g == null or _g.World == null or not is_instance_valid(_g.World):
 		return
-	var seen := []
-	var levels = _g.World.get("Levels")
-	if levels != null:
-		for lvl in levels:
-			seen.append(lvl)
 	for lid in _levels.keys():
 		var e = _levels[lid]
-		if e.get("level") != null and not seen.has(e["level"]):
-			seen.append(e["level"])
-	var curl = _current_level()
-	if curl != null and not seen.has(curl):
-		seen.append(curl)
-	for lvl in seen:
-		if lvl == null or not is_instance_valid(lvl):
+		var terrain = _vanilla_terrain(e)
+		if terrain == null:
 			continue
-		var terrain = lvl.get("Terrain")
-		if terrain != null and is_instance_valid(terrain):
-			terrain.visible = not _hide_vanilla
-			terrain.set("Enabled", not _hide_vanilla)
+		var on = bool(e.get("hide_vanilla", false))
+		var full = str(e.get("hide_mode", "full")) == "full"
+		if on and full:
+			if not e.has("vanilla_was_visible"):
+				e["vanilla_was_visible"] = terrain.visible
+			terrain.visible = false
+		elif not on and e.has("vanilla_was_visible"):
+			terrain.visible = bool(e["vanilla_was_visible"])
+			e.erase("vanilla_was_visible")
+	var cur = _cur_entry()
+	var hide_tool = cur != null and bool(cur.get("hide_vanilla", false))
 	var toolset = _g.Editor.Toolset if _g.Editor != null else null
 	if toolset != null:
 		var toolbars = toolset.get("Toolbars")
 		if toolbars is Dictionary and toolbars.has(TOOL_CATEGORY):
 			var btn = _find_toolbar_button(toolbars[TOOL_CATEGORY], "TerrainBrush")
 			if btn != null and is_instance_valid(btn):
-				btn.visible = not _hide_vanilla
+				btn.visible = not hide_tool
+	_sync_hide_vanilla_ui()
+
+
+# Button state and label for the current level: "Hide Vanilla Terrain"
+# when the vanilla terrain is (or would be) hidden by us, "Hide Vanilla
+# Terrain Brush Tool" when DD's terrain is already disabled by its own tool.
+func _sync_hide_vanilla_ui() -> void:
+	if _hide_vanilla_check == null or not is_instance_valid(_hide_vanilla_check):
+		return
+	var entry = _cur_entry()
+	if entry == null:
+		return
+	var on = bool(entry.get("hide_vanilla", false))
+	var tool_only: bool
+	if on:
+		tool_only = str(entry.get("hide_mode", "full")) == "tool"
+	else:
+		var terrain = _vanilla_terrain(entry)
+		tool_only = terrain != null and not terrain.visible
+	var label = "Hide Vanilla Terrain Brush Tool" if tool_only else "Hide Vanilla Terrain"
+	if _hide_vanilla_check.text != label:
+		_hide_vanilla_check.text = label
+	if _hide_vanilla_check.pressed != on:
+		_ui_syncing = true
+		_hide_vanilla_check.pressed = on
+		_ui_syncing = false
 
 
 # Replaces the CheckButton ON/OFF switch with a down.png chevron docked at
@@ -5488,6 +6085,566 @@ func _attach_chevron(btn: Button, open: bool) -> void:
 	# Hide the theme's switch graphics: keep only icon + text + chevron.
 	for st in ["on", "off", "on_disabled", "off_disabled"]:
 		btn.add_icon_override(st, ImageTexture.new())
+
+
+# ── Gradient overlay UI ──────────────────────────────────────────────────────
+func _build_gradient_ui(parent: VBoxContainer) -> void:
+	# Header = the ON/OFF switch itself (like Clipping Mask / Light Painting):
+	# ON enables the gradient AND unfolds its settings.
+	_grad_enable = CheckButton.new()
+	_grad_enable.text = "Gradient"
+	_grad_enable.align = Button.ALIGN_CENTER
+	var gic = _load_icon(_root + "icons/gradient.png")
+	if gic != null:
+		_grad_enable.icon = gic
+	_grad_enable.hint_tooltip = "Photoshop-style gradient overlay on the selected layer / group: colour stops with alpha, axis drawn on the map, own blend mode and colour settings."
+	_grad_enable.connect("toggled", self, "_on_grad_enable")
+	parent.add_child(_grad_enable)
+	_grad_box = VBoxContainer.new()
+	_grad_box.visible = false
+	parent.add_child(_grad_box)
+	# Draw / Reset
+	var mrow = HBoxContainer.new()
+	_grad_setmap_btn = Button.new()
+	_grad_setmap_btn.text = "Draw Gradient"
+	_grad_setmap_btn.toggle_mode = true
+	_grad_setmap_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_grad_setmap_btn.hint_tooltip = "Then drag on the map: press = start of the gradient, release = end (radial: centre and radius). The axis is shown on the map while this is on."
+	_grad_setmap_btn.connect("toggled", self, "_on_grad_setmap")
+	mrow.add_child(_framed(_grad_setmap_btn))
+	var rst = _mk_btn("Reset Gradient", "_on_grad_reset")
+	mrow.add_child(_framed(rst))
+	_grad_box.add_child(mrow)
+	# Preview bar + stops editor
+	_grad_preview = TextureRect.new()
+	_grad_preview.expand = true
+	_grad_preview.stretch_mode = TextureRect.STRETCH_SCALE
+	_grad_preview.rect_min_size = Vector2(0, 18)
+	_grad_preview.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_grad_preview.hint_tooltip = "Double-click to add a stop."
+	_grad_preview.connect("gui_input", self, "_on_grad_preview_input")
+	_grad_box.add_child(_grad_preview)
+	_grad_stops_ctrl = _mk_grad_stops_ctrl()
+	_grad_box.add_child(_grad_stops_ctrl)
+	# Selected stop: colour / position / midpoint / add / remove
+	var srow = HBoxContainer.new()
+	var slbl = Label.new()
+	slbl.text = "Stop"
+	slbl.rect_min_size = Vector2(84, 0)
+	srow.add_child(slbl)
+	_grad_color_btn = ColorPickerButton.new()
+	_grad_color_btn.rect_min_size = Vector2(48, 0)
+	_grad_color_btn.edit_alpha = true
+	_grad_color_btn.hint_tooltip = "Colour and alpha of the selected stop."
+	_grad_color_btn.connect("color_changed", self, "_on_grad_stop_color")
+	srow.add_child(_grad_color_btn)
+	_grad_pos_spin = _mk_spin(0, 100, 1, 0, "_on_grad_stop_pos")
+	_grad_pos_spin.hint_tooltip = "Position of the selected stop (%)."
+	srow.add_child(_grad_pos_spin)
+	_grad_mid_spin = _mk_spin(2, 98, 1, 50, "_on_grad_stop_mid")
+	_grad_mid_spin.hint_tooltip = "Midpoint (%): where the 50% mix sits between this stop and the next one."
+	srow.add_child(_grad_mid_spin)
+	var addb = Button.new()
+	addb.text = "+"
+	addb.hint_tooltip = "Add a stop after the selected one."
+	addb.connect("pressed", self, "_on_grad_stop_add")
+	srow.add_child(addb)
+	var remb = Button.new()
+	remb.text = "−"
+	remb.hint_tooltip = "Remove the selected stop (two stops minimum)."
+	remb.connect("pressed", self, "_on_grad_stop_remove")
+	srow.add_child(remb)
+	_grad_box.add_child(srow)
+	# Type / repeat
+	var trow = HBoxContainer.new()
+	var tlbl = Label.new()
+	tlbl.text = "Type"
+	tlbl.rect_min_size = Vector2(84, 0)
+	trow.add_child(tlbl)
+	_grad_type_opt = OptionButton.new()
+	_grad_type_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	for nm in ["Linear", "Radial", "Reflected"]:
+		_grad_type_opt.add_item(nm)
+	_grad_type_opt.connect("item_selected", self, "_on_grad_type")
+	trow.add_child(_grad_type_opt)
+	_grad_box.add_child(trow)
+	# Opacity
+	_grad_opacity_slider = _mk_slider(0, 100, 1, 100, "_on_grad_opacity")
+	_grad_box.add_child(_labeled("Opacity %", _grad_opacity_slider))
+	# The gradient's own colour settings (blend mode, adjustments, tint, Levels).
+	_gcs.build(_grad_box)
+
+
+func _mk_grad_stops_ctrl() -> Control:
+	if _grad_stops_script == null:
+		var sc = GDScript.new()
+		sc.source_code = """extends Control
+var handler = null
+func _draw():
+	if handler != null:
+		handler.grad_stops_draw(self)
+func _gui_input(e):
+	if handler != null:
+		handler.grad_stops_input(self, e)
+"""
+		sc.reload()
+		_grad_stops_script = sc
+	var c = Control.new()
+	c.set_script(_grad_stops_script)
+	c.handler = self
+	c.rect_min_size = Vector2(0, 24)
+	c.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	c.mouse_filter = Control.MOUSE_FILTER_STOP
+	c.hint_tooltip = "Drag a stop to move it, drag a diamond to move a midpoint, right-click a stop to remove it."
+	return c
+
+
+const GRAD_STOP_INSET = 6.0
+
+
+func _grad_target():
+	var t = cs_target()
+	return _grad_of(t) if t != null else null
+
+
+func _grad_x_of(ctrl: Control, pos: float) -> float:
+	return GRAD_STOP_INSET + pos * max(ctrl.rect_size.x - 2.0 * GRAD_STOP_INSET, 1.0)
+
+
+func _grad_pos_of(ctrl: Control, x: float) -> float:
+	return clamp((x - GRAD_STOP_INSET) / max(ctrl.rect_size.x - 2.0 * GRAD_STOP_INSET, 1.0), 0.0, 1.0)
+
+
+func grad_stops_draw(ctrl: Control) -> void:
+	var gd = _grad_target()
+	if gd == null:
+		return
+	var h = ctrl.rect_size.y
+	var stops = gd["stops"]
+	var order = _grad_stop_order(gd)
+	# Midpoint diamonds between consecutive stops.
+	for i in range(order.size() - 1):
+		var a = stops[order[i]]
+		var b = stops[order[i + 1]]
+		var pa = float(a["pos"])
+		var pb = float(b["pos"])
+		var mx = _grad_x_of(ctrl, pa + (pb - pa) * clamp(float(a.get("mid", 0.5)), 0.02, 0.98))
+		var my = h * 0.35
+		var dcol = Color(0.85, 0.85, 0.85, 0.9)
+		ctrl.draw_colored_polygon(PoolVector2Array([Vector2(mx, my - 4), Vector2(mx + 4, my), Vector2(mx, my + 4), Vector2(mx - 4, my)]), dcol)
+	# Stops: triangle pointing up + colour swatch.
+	for idx in range(stops.size()):
+		var st = stops[idx]
+		var x = _grad_x_of(ctrl, float(st["pos"]))
+		var c = Color(str(st["color"]))
+		var sel = idx == _grad_stop_sel
+		var outline = Color(1, 1, 1, 1) if sel else Color(0.15, 0.15, 0.15, 1)
+		ctrl.draw_colored_polygon(PoolVector2Array([Vector2(x, 2), Vector2(x + 6, 9), Vector2(x - 6, 9)]), outline)
+		ctrl.draw_rect(Rect2(x - 6, 9, 12, h - 11), outline, true)
+		ctrl.draw_rect(Rect2(x - 4, 11, 8, h - 15), Color(c.r, c.g, c.b, 1), true)
+		if c.a < 1.0:
+			# Alpha shown as a half-height dark inset proportional to (1 - a).
+			ctrl.draw_rect(Rect2(x - 4, 11, 8, (h - 15) * (1.0 - c.a)), Color(0, 0, 0, 0.6), true)
+
+
+# Stop indices sorted by position.
+func _grad_stop_order(gd: Dictionary) -> Array:
+	var idx := []
+	for i in range(gd["stops"].size()):
+		idx.append(i)
+	var stops = gd["stops"]
+	var n = idx.size()
+	for i in range(n):
+		for j in range(n - 1 - i):
+			if float(stops[idx[j]]["pos"]) > float(stops[idx[j + 1]]["pos"]):
+				var tmp = idx[j]
+				idx[j] = idx[j + 1]
+				idx[j + 1] = tmp
+	return idx
+
+
+func grad_stops_input(ctrl: Control, e) -> void:
+	var gd = _grad_target()
+	if gd == null:
+		return
+	var stops = gd["stops"]
+	if e is InputEventMouseButton:
+		if e.button_index == BUTTON_LEFT:
+			if e.pressed:
+				# Nearest stop first, then nearest midpoint.
+				var best = -1
+				var bd = 9.0
+				for i in range(stops.size()):
+					var d = abs(_grad_x_of(ctrl, float(stops[i]["pos"])) - e.position.x)
+					if d < bd:
+						bd = d
+						best = i
+				if best >= 0:
+					_grad_stop_sel = best
+					_grad_drag = best
+					_grad_drag_mid = -1
+					_sync_grad_ui()
+					ctrl.update()
+					return
+				var order = _grad_stop_order(gd)
+				for i in range(order.size() - 1):
+					var a = stops[order[i]]
+					var b = stops[order[i + 1]]
+					var pa = float(a["pos"])
+					var pb = float(b["pos"])
+					var mx = _grad_x_of(ctrl, pa + (pb - pa) * clamp(float(a.get("mid", 0.5)), 0.02, 0.98))
+					if abs(mx - e.position.x) < 7.0:
+						_grad_drag_mid = i
+						_grad_drag = -1
+						return
+			else:
+				if _grad_drag >= 0 or _grad_drag_mid >= 0:
+					_grad_drag = -1
+					_grad_drag_mid = -1
+					_grad_refresh(gd)
+					_persist()
+			return
+		if e.button_index == BUTTON_RIGHT and e.pressed:
+			var best = -1
+			var bd = 9.0
+			for i in range(stops.size()):
+				var d = abs(_grad_x_of(ctrl, float(stops[i]["pos"])) - e.position.x)
+				if d < bd:
+					bd = d
+					best = i
+			if best >= 0:
+				_grad_stop_sel = best
+				_on_grad_stop_remove()
+			return
+	elif e is InputEventMouseMotion and Input.is_mouse_button_pressed(BUTTON_LEFT):
+		if _grad_drag >= 0 and _grad_drag < stops.size():
+			stops[_grad_drag]["pos"] = _grad_pos_of(ctrl, e.position.x)
+			_grad_live(gd)
+		elif _grad_drag_mid >= 0:
+			var order = _grad_stop_order(gd)
+			if _grad_drag_mid < order.size() - 1:
+				var a = stops[order[_grad_drag_mid]]
+				var b = stops[order[_grad_drag_mid + 1]]
+				var pa = float(a["pos"])
+				var pb = float(b["pos"])
+				var t = _grad_pos_of(ctrl, e.position.x)
+				if pb > pa:
+					a["mid"] = clamp((t - pa) / (pb - pa), 0.02, 0.98)
+					_grad_live(gd)
+
+
+# Cheap live update while dragging (LUT + uniforms, no persist).
+func _grad_live(gd: Dictionary) -> void:
+	_grad_refresh(gd)
+	_sync_grad_ui(false)
+
+
+func _on_grad_preview_input(e) -> void:
+	if e is InputEventMouseButton and e.button_index == BUTTON_LEFT and e.pressed and e.doubleclick:
+		var gd = _grad_target()
+		if gd == null:
+			return
+		var t = _grad_pos_of(_grad_preview, e.position.x)
+		var c = _grad_eval(_grad_sorted_stops(gd), t)
+		gd["stops"].append({"pos": t, "color": c.to_html(true), "mid": 0.5})
+		_grad_stop_sel = gd["stops"].size() - 1
+		_grad_refresh(gd)
+		_sync_grad_ui()
+		_persist()
+
+
+func _on_grad_enable(on: bool) -> void:
+	if _grad_box != null and is_instance_valid(_grad_box):
+		_grad_box.visible = on
+	if _ui_syncing:
+		return
+	for gd in grad_cs_edit_targets():
+		gd["on"] = on
+		_grad_refresh(gd)
+	if not on and _grad_setmap_btn != null and is_instance_valid(_grad_setmap_btn):
+		_grad_setmap_btn.pressed = false
+	_sync_grad_ui()
+	_persist()
+
+
+func _on_grad_stop_color(c: Color) -> void:
+	if _ui_syncing:
+		return
+	var gd = _grad_target()
+	if gd == null or _grad_stop_sel >= gd["stops"].size():
+		return
+	gd["stops"][_grad_stop_sel]["color"] = c.to_html(true)
+	_grad_refresh(gd)
+	_grad_stops_ctrl.update()
+	_schedule_persist()
+
+
+func _on_grad_stop_pos(v: float) -> void:
+	if _ui_syncing:
+		return
+	var gd = _grad_target()
+	if gd == null or _grad_stop_sel >= gd["stops"].size():
+		return
+	gd["stops"][_grad_stop_sel]["pos"] = clamp(v / 100.0, 0.0, 1.0)
+	_grad_refresh(gd)
+	_grad_stops_ctrl.update()
+	_schedule_persist()
+
+
+func _on_grad_stop_mid(v: float) -> void:
+	if _ui_syncing:
+		return
+	var gd = _grad_target()
+	if gd == null or _grad_stop_sel >= gd["stops"].size():
+		return
+	gd["stops"][_grad_stop_sel]["mid"] = clamp(v / 100.0, 0.02, 0.98)
+	_grad_refresh(gd)
+	_grad_stops_ctrl.update()
+	_schedule_persist()
+
+
+func _on_grad_stop_add() -> void:
+	var gd = _grad_target()
+	if gd == null:
+		return
+	var stops = gd["stops"]
+	var order = _grad_stop_order(gd)
+	var k = order.find(_grad_stop_sel)
+	var pa = float(stops[_grad_stop_sel]["pos"]) if _grad_stop_sel < stops.size() else 0.0
+	var pb = float(stops[order[k + 1]]["pos"]) if (k >= 0 and k + 1 < order.size()) else 1.0
+	var t = (pa + pb) * 0.5 if pb > pa else min(pa + 0.1, 1.0)
+	var c = _grad_eval(_grad_sorted_stops(gd), t)
+	stops.append({"pos": t, "color": c.to_html(true), "mid": 0.5})
+	_grad_stop_sel = stops.size() - 1
+	_grad_refresh(gd)
+	_sync_grad_ui()
+	_persist()
+
+
+func _on_grad_stop_remove() -> void:
+	var gd = _grad_target()
+	if gd == null or gd["stops"].size() <= 2 or _grad_stop_sel >= gd["stops"].size():
+		return
+	gd["stops"].remove(_grad_stop_sel)
+	_grad_stop_sel = min(_grad_stop_sel, gd["stops"].size() - 1)
+	_grad_refresh(gd)
+	_sync_grad_ui()
+	_persist()
+
+
+func _on_grad_type(idx: int) -> void:
+	if _ui_syncing:
+		return
+	for gd in grad_cs_edit_targets():
+		gd["type"] = idx
+		_grad_refresh(gd)
+	_persist()
+
+
+func _on_grad_opacity(v: float) -> void:
+	if _ui_syncing:
+		return
+	for gd in grad_cs_edit_targets():
+		gd["opacity"] = v / 100.0
+		_grad_refresh(gd)
+	_schedule_persist()
+
+
+func _on_grad_setmap(on: bool) -> void:
+	if _ui_syncing:
+		return
+	var gd = _grad_target()
+	if on and (gd == null or not bool(gd["on"])):
+		_grad_setmap_btn.pressed = false   # nothing to draw on
+		return
+	_grad_pick = on
+	_grad_pick_down = false
+	_grad_overlay_update()
+
+
+# ── Gradient axis indicator on the map (visible in Draw mode) ───────────────
+func _ensure_grad_overlay() -> void:
+	if _grad_overlay != null and is_instance_valid(_grad_overlay):
+		return
+	var world = _g.get("World")
+	if world == null or not (world is Node):
+		return
+	if _grad_overlay_script == null:
+		var sc = GDScript.new()
+		sc.source_code = """extends Node2D
+var handler = null
+func _draw():
+	if handler != null:
+		handler.grad_overlay_draw(self)
+"""
+		sc.reload()
+		_grad_overlay_script = sc
+	_grad_overlay = Node2D.new()
+	_grad_overlay.name = "BetterTerrainGradientAxis"
+	_grad_overlay.set_script(_grad_overlay_script)
+	_grad_overlay.handler = self
+	_grad_overlay.z_as_relative = false
+	_grad_overlay.z_index = 4001
+	_grad_overlay.visible = false
+	world.add_child(_grad_overlay)
+
+
+func _grad_overlay_update() -> void:
+	var gd = _grad_target()
+	var show = _grad_pick and _tool_active and gd != null and bool(gd["on"])
+	if not show:
+		if _grad_overlay != null and is_instance_valid(_grad_overlay):
+			_grad_overlay.visible = false
+		return
+	_ensure_grad_overlay()
+	if _grad_overlay == null:
+		return
+	_grad_overlay.visible = true
+	_grad_overlay.update()
+
+
+func grad_overlay_draw(n: Node2D) -> void:
+	var gd = _grad_target()
+	if gd == null:
+		return
+	var p0 = Vector2(float(gd["p0x"]), float(gd["p0y"]))
+	var p1 = Vector2(float(gd["p1x"]), float(gd["p1y"]))
+	var typ = int(gd["type"])
+	# Screen-constant sizes: divide by the camera zoom.
+	var zoom = 1.0
+	var cam = n.get_viewport().get_canvas_transform()
+	if cam.get_scale().x > 0.0:
+		zoom = cam.get_scale().x
+	var w = 2.0 / zoom
+	var hw = 4.0 / zoom
+	var r = 6.0 / zoom
+	var ah = 14.0 / zoom
+	var dark = Color(0, 0, 0, 0.75)
+	var light = Color(1, 1, 1, 0.95)
+	var d = p1 - p0
+	var dlen = d.length()
+	if typ == 1:
+		# Radial: centre + radius circle.
+		n.draw_arc(p0, max(dlen, 1.0), 0.0, TAU, 96, dark, hw)
+		n.draw_arc(p0, max(dlen, 1.0), 0.0, TAU, 96, light, w)
+		n.draw_line(p0, p1, dark, hw)
+		n.draw_line(p0, p1, light, w)
+	else:
+		var a = p0
+		var b = p1
+		if typ == 2:
+			a = p0 - d   # reflected: mirrored on both sides of p0
+		n.draw_line(a, b, dark, hw)
+		n.draw_line(a, b, light, w)
+		if dlen > 1.0:
+			var dir = d / dlen
+			var nrm = Vector2(-dir.y, dir.x)
+			var tip = p1
+			var base = p1 - dir * ah
+			var pts = PoolVector2Array([tip, base + nrm * ah * 0.5, base - nrm * ah * 0.5])
+			n.draw_colored_polygon(pts, light)
+			n.draw_polyline(PoolVector2Array([pts[0], pts[1], pts[2], pts[0]]), dark, w)
+			if typ == 2:
+				var tip2 = a
+				var base2 = a + dir * ah
+				var pts2 = PoolVector2Array([tip2, base2 + nrm * ah * 0.5, base2 - nrm * ah * 0.5])
+				n.draw_colored_polygon(pts2, light)
+				n.draw_polyline(PoolVector2Array([pts2[0], pts2[1], pts2[2], pts2[0]]), dark, w)
+	n.draw_circle(p0, r + w, dark)
+	n.draw_circle(p0, r, light)
+
+
+func _on_grad_reset() -> void:
+	var t = cs_target()
+	if t == null:
+		return
+	var old = t.get("grad")
+	var keep_on = bool(old.get("on", false)) if old is Dictionary else false
+	t["grad"] = null
+	var gd = _grad_of(t)
+	gd["on"] = keep_on
+	_grad_stop_sel = 0
+	_grad_refresh(gd)
+	_sync_grad_ui()
+	_persist()
+
+
+# Gradient axis drawn on the map ("Set on map"): press = p0, drag/release = p1.
+func _grad_pick_input(event) -> bool:
+	if not _grad_pick:
+		return false
+	var ui = _g.get("WorldUI") if _g != null else null
+	var mp = ui.get("MousePosition") if ui != null else null
+	if not (mp is Vector2):
+		return true
+	if event is InputEventMouseButton and event.button_index == BUTTON_LEFT:
+		if event.pressed:
+			_grad_pick_down = true
+			for gd in grad_cs_edit_targets():
+				gd["p0x"] = mp.x
+				gd["p0y"] = mp.y
+				gd["p1x"] = mp.x + 1.0
+				gd["p1y"] = mp.y
+				_grad_refresh(gd)
+		elif _grad_pick_down:
+			_grad_pick_down = false
+			for gd in grad_cs_edit_targets():
+				gd["p1x"] = mp.x
+				gd["p1y"] = mp.y
+				_grad_refresh(gd)
+			_persist()   # Draw mode stays on (toggle the button to leave it)
+		return true
+	if event is InputEventMouseMotion and _grad_pick_down:
+		for gd in grad_cs_edit_targets():
+			gd["p1x"] = mp.x
+			gd["p1y"] = mp.y
+			_grad_refresh(gd)
+		return true
+	return true
+
+
+func _sync_grad_preview() -> void:
+	if _grad_preview == null or not is_instance_valid(_grad_preview):
+		return
+	var gd = _grad_target()
+	if gd == null:
+		return
+	_grad_preview.texture = _grad_lut(gd)
+	if _grad_stops_ctrl != null and is_instance_valid(_grad_stops_ctrl):
+		_grad_stops_ctrl.update()
+
+
+func _sync_grad_ui(with_colors := true) -> void:
+	if _grad_enable == null or not is_instance_valid(_grad_enable):
+		return
+	var gd = _grad_target()
+	if _grad_pick and (gd == null or not bool(gd["on"])):
+		_grad_pick = false
+		_grad_pick_down = false
+		if _grad_setmap_btn != null and is_instance_valid(_grad_setmap_btn):
+			_ui_syncing = true
+			_grad_setmap_btn.pressed = false
+			_ui_syncing = false
+	_grad_enable.visible = gd != null
+	_grad_box.visible = gd != null and bool(gd["on"])
+	if gd == null:
+		_grad_overlay_update()
+		return
+	if _grad_stop_sel >= gd["stops"].size():
+		_grad_stop_sel = 0
+	_ui_syncing = true
+	_grad_enable.pressed = bool(gd["on"])
+	var st = gd["stops"][_grad_stop_sel]
+	_grad_color_btn.color = Color(str(st["color"]))
+	_grad_pos_spin.value = round(float(st["pos"]) * 100.0)
+	_grad_mid_spin.value = round(float(st.get("mid", 0.5)) * 100.0)
+	_grad_type_opt.select(int(gd["type"]))
+	_grad_opacity_slider.value = round(float(gd["opacity"]) * 100.0)
+	_ui_syncing = false
+	_sync_grad_preview()
+	_grad_overlay_update()
+	if with_colors and _gcs != null:
+		_gcs.sync_ui()
 
 
 func _on_transform_toggle(on: bool) -> void:
@@ -6499,6 +7656,7 @@ func _start_inline_rename(uid: int) -> void:
 	var btn: Button = r["btn"]
 	_rename_uid = uid
 	_rename_edit = LineEdit.new()
+	_guard_text_input(_rename_edit)
 	_rename_edit.text = str(layer["name"])
 	_rename_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_rename_edit.rect_min_size = Vector2(0, _row_h())
@@ -6685,6 +7843,7 @@ func _start_group_rename(guid: int) -> void:
 		return
 	_rename_guid = guid
 	_rename_edit = LineEdit.new()
+	_guard_text_input(_rename_edit)
 	_rename_edit.text = str(g["name"])
 	_rename_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_rename_edit.rect_min_size = Vector2(0, 26)
@@ -6828,7 +7987,7 @@ func _group_in_level(level_id: int, guid: int):
 const GRP_DEFAULTS = {"opacity": 1.0, "blend": 0, "smoothness": 1536.0, "res": DEFAULT_RES}
 # The group's own colour settings, persisted with the map.
 const GRP_CS_KEYS = ["hue", "saturation", "lightness", "gamma", "contrast", "tint_color", "tint_amount", "color_blend", "levels",
-	"tex_rot", "tex_scale", "tex_off_x", "tex_off_y", "light_paint", "light_intensity", "clip", "clip_obj"]
+	"tex_rot", "tex_scale", "tex_off_x", "tex_off_y", "light_paint", "light_intensity", "clip", "clip_obj", "grad"]
 
 
 # Phase B: the group is a quasi-layer with its OWN fusion mask, painted with
@@ -6988,6 +8147,7 @@ func _grp_push_params(g: Dictionary) -> void:
 		# Group Light Painting.
 		mat.set_shader_param("grp_light_on", 1.0 if glight else 0.0)
 		mat.set_shader_param("grp_light_gain", float(g["light_intensity"]))
+		_push_grad(mat, "grp_", g.get("grad"))
 		# Group clipping stencil (built by _grp_clip_update).
 		var cvp = g.get("clip_vp")
 		if cvp != null and is_instance_valid(cvp) and int(g.get("clip", 0)) > 0:
@@ -7123,7 +8283,7 @@ func _ser_group(g: Dictionary) -> Dictionary:
 		"smoothness": float(g.get("smoothness", 1536.0)), "res": int(g.get("res", DEFAULT_RES))}
 	for ck in GRP_CS_KEYS:
 		if g.has(ck):
-			d[ck] = g[ck].duplicate(true) if g[ck] is Dictionary else g[ck]
+			d[ck] = _grad_ser(g[ck]) if ck == "grad" else (g[ck].duplicate(true) if g[ck] is Dictionary else g[ck])
 	if g.get("mask") is Image:
 		d["mask"] = (g["mask"] as Image).duplicate()
 	return d
@@ -7512,6 +8672,7 @@ func _sync_props() -> void:
 	_props_box.visible = layer != null
 	_update_generate_label()
 	_sync_organic_post()
+	_sync_grad_ui()
 	if _props_top != null and is_instance_valid(_props_top):
 		_props_top.visible = layer != null and grp == null
 	if layer == null:
@@ -7605,6 +8766,8 @@ func _on_add_layer() -> void:
 		z = max(z, int(l["z"]) + 10)
 	var layer = _new_layer(entry, "", tex, z, 1.0, true, DEFAULT_RES)
 	_sel_uid = layer["uid"]
+	_sel_multi = [_sel_uid]   # a new layer is the whole selection
+	_sel_group = -1
 	_record_op({"type": "add", "level_id": _cur_level_id, "layer": _serialize_layer(layer)})
 	_schedule_persist()
 	_refresh_layer_list()
@@ -9345,6 +10508,7 @@ func _ensure_picker() -> void:
 	search_lbl.text = "Search"
 	search_row.add_child(search_lbl)
 	_picker_search = LineEdit.new()
+	_guard_text_input(_picker_search)
 	_picker_search.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_picker_search.placeholder_text = "Filter terrains by name…"
 	_picker_search.connect("text_changed", self, "_on_picker_search")

@@ -1,0 +1,8 @@
+v1.1.0
+- New feature: Gradients
+- New feature: Clone terrain to selected level (the button appears at the bottom of the left menu when there's more than one level)
+- Hide Terrain is now layer dependant
+- Fixed Clone Level not cloning BTT
+- Fixed multi level maps sometimes mixing levels at reload
+- Fixed shortcuts being triggered in text boxes.
+

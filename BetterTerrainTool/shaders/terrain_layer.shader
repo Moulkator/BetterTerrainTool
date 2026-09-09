@@ -1,6 +1,6 @@
 shader_type canvas_item;
 render_mode blend_mix;
-// BTT_GRP_V3 -- version marker checked by better_terrain_tool.gd at boot.
+// BTT_GRP_V4 -- version marker checked by better_terrain_tool.gd at boot.
 
 uniform sampler2D tile;
 uniform sampler2D mask;
@@ -65,6 +65,26 @@ uniform float grp_light_gain = 1.0;
 uniform float grp_clip_on = 0.0;                // group clipping mask
 uniform sampler2D grp_clip_mask;
 uniform vec2 grp_clip_texel = vec2(0.0);
+// Gradient overlay (Photoshop "Gradient Overlay"): a 1D LUT built by the
+// host from the colour stops, projected on a map-space axis p0 -> p1 and
+// blended over the layer's colour with one of the blend modes.
+uniform float grad_on = 0.0;
+uniform sampler2D grad_tex;
+uniform float grad_type = 0.0;                  // 0 linear, 1 radial, 2 reflected
+uniform vec2 grad_p0 = vec2(0.0);
+uniform vec2 grad_p1 = vec2(1024.0, 0.0);
+uniform float grad_repeat = 0.0;
+uniform float grad_opacity = 1.0;
+uniform float grad_blend = 0.0;
+// Same thing at the group level, applied after the group's colour stage.
+uniform float grp_grad_on = 0.0;
+uniform sampler2D grp_grad_tex;
+uniform float grp_grad_type = 0.0;
+uniform vec2 grp_grad_p0 = vec2(0.0);
+uniform vec2 grp_grad_p1 = vec2(1024.0, 0.0);
+uniform float grp_grad_repeat = 0.0;
+uniform float grp_grad_opacity = 1.0;
+uniform float grp_grad_blend = 0.0;
 uniform sampler2D grp_mblur;                    // member mask blurred at the GROUP's smoothness
 uniform vec2 grp_mblur_scale = vec2(1.0, 1.0);
 uniform vec2 grp_mblur_texel = vec2(0.0, 0.0);
@@ -141,6 +161,93 @@ vec3 set_sat(vec3 c, float s) {
 		return vec3(0.0);
 	}
 	return (c - mn) * s / (mx - mn);
+}
+
+// Photoshop-style blend of `sc` over the backdrop `d` (modes 1..22, see
+// CB_NAMES in color_settings.gd). Mode 0 / unknown: returns `sc`.
+vec3 blend_rgb(int m, vec3 d, vec3 sc) {
+	vec3 r = sc;
+	if (m == 1) {                       // Darken
+		r = min(d, sc);
+	} else if (m == 2) {                // Multiply
+		r = d * sc;
+	} else if (m == 3) {                // Color Burn
+		r = 1.0 - clamp((1.0 - d) / max(sc, vec3(0.004)), vec3(0.0), vec3(1.0));
+	} else if (m == 4) {                // Linear Burn
+		r = clamp(d + sc - 1.0, 0.0, 1.0);
+	} else if (m == 5) {                // Darker Color
+		r = lum3(sc) < lum3(d) ? sc : d;
+	} else if (m == 6) {                // Lighten
+		r = max(d, sc);
+	} else if (m == 7) {                // Screen
+		r = 1.0 - (1.0 - d) * (1.0 - sc);
+	} else if (m == 8) {                // Color Dodge
+		r = clamp(d / max(1.0 - sc, vec3(0.004)), vec3(0.0), vec3(1.0));
+	} else if (m == 9) {                // Linear Dodge (Add)
+		r = clamp(d + sc, 0.0, 1.0);
+	} else if (m == 10) {               // Lighter Color
+		r = lum3(sc) > lum3(d) ? sc : d;
+	} else if (m == 11) {               // Overlay
+		vec3 lo = 2.0 * d * sc;
+		vec3 hi = 1.0 - 2.0 * (1.0 - d) * (1.0 - sc);
+		r = mix(lo, hi, step(vec3(0.5), d));
+	} else if (m == 12) {               // Soft Light
+		vec3 lo = d - (1.0 - 2.0 * sc) * d * (1.0 - d);
+		vec3 hi = d + (2.0 * sc - 1.0) * (sqrt(d) - d);
+		r = mix(lo, hi, step(vec3(0.5), sc));
+	} else if (m == 13) {               // Hard Light
+		vec3 lo = 2.0 * d * sc;
+		vec3 hi = 1.0 - 2.0 * (1.0 - d) * (1.0 - sc);
+		r = mix(lo, hi, step(vec3(0.5), sc));
+	} else if (m == 14) {               // Vivid Light
+		vec3 lo = 1.0 - clamp((1.0 - d) / max(2.0 * sc, vec3(0.004)), vec3(0.0), vec3(1.0));
+		vec3 hi = clamp(d / max(2.0 * (1.0 - sc), vec3(0.004)), vec3(0.0), vec3(1.0));
+		r = mix(lo, hi, step(vec3(0.5), sc));
+	} else if (m == 15) {               // Linear Light
+		r = clamp(d + 2.0 * sc - 1.0, 0.0, 1.0);
+	} else if (m == 16) {               // Pin Light
+		vec3 lo = min(d, 2.0 * sc);
+		vec3 hi = max(d, 2.0 * sc - 1.0);
+		r = mix(lo, hi, step(vec3(0.5), sc));
+	} else if (m == 17) {               // Subtract
+		r = clamp(d - sc, 0.0, 1.0);
+	} else if (m == 18) {               // Inverse Subtract
+		r = clamp(sc - d, 0.0, 1.0);
+	} else if (m == 19) {               // Hue
+		r = set_lum(set_sat(sc, sat3(d)), lum3(d));
+	} else if (m == 20) {               // Saturation
+		r = set_lum(set_sat(d, sat3(sc)), lum3(d));
+	} else if (m == 21) {               // Color
+		r = set_lum(sc, lum3(d));
+	} else if (m == 22) {               // Luminosity
+		r = set_lum(d, lum3(sc));
+	}
+	return r;
+}
+
+// Position along a gradient axis, in [0, 1] (or wrapped when repeating).
+float grad_t(vec2 wp, vec2 p0, vec2 p1, float type, float rep) {
+	vec2 d = p1 - p0;
+	float len2 = max(dot(d, d), 1.0);
+	float t;
+	if (type > 1.5) {                              // reflected: mirrored around p0
+		t = abs(dot(wp - p0, d) / len2);
+	} else if (type > 0.5) {                       // radial: distance from p0
+		t = length(wp - p0) / sqrt(len2);
+	} else {                                       // linear
+		t = dot(wp - p0, d) / len2;
+	}
+	if (rep > 0.5) {
+		t = fract(t);
+	}
+	return clamp(t, 0.0, 1.0);
+}
+
+vec3 grad_apply(vec3 rgb, sampler2D lut, vec2 wp, vec2 p0, vec2 p1, float type, float rep, float opac, float mode) {
+	vec4 gc = texture(lut, vec2(grad_t(wp, p0, p1, type, rep), 0.5));
+	int m = int(mode + 0.5);
+	vec3 top = (m >= 1 && m <= 22) ? blend_rgb(m, rgb, gc.rgb) : gc.rgb;
+	return mix(rgb, top, clamp(gc.a * opac, 0.0, 1.0));
 }
 
 void fragment() {
@@ -297,6 +404,9 @@ void fragment() {
 		rgb = levels3(rgb, lv_in_lo, lv_in_hi, lv_gamma, lv_out_lo, lv_out_hi);
 		rgb = levels3(rgb, vec3(lv_m_in_lo), vec3(lv_m_in_hi), vec3(lv_m_gamma), vec3(lv_m_out_lo), vec3(lv_m_out_hi));
 	}
+	if (grad_on > 0.5 && color_blend < 22.5 && !g_light) {
+		rgb = grad_apply(rgb, grad_tex, world_pos, grad_p0, grad_p1, grad_type, grad_repeat, grad_opacity, grad_blend);
+	}
 	if (grp_on > 0.5) {
 		// The GROUP's own colour settings: a full second pipeline, applied on
 		// top of the member's result. The members' dictionaries are never
@@ -315,6 +425,9 @@ void fragment() {
 			rgb = levels3(rgb, glv_in_lo, glv_in_hi, glv_gamma, glv_out_lo, glv_out_hi);
 			rgb = levels3(rgb, vec3(glv_m_in_lo), vec3(glv_m_in_hi), vec3(glv_m_gamma), vec3(glv_m_out_lo), vec3(glv_m_out_hi));
 		}
+		if (grp_grad_on > 0.5 && color_blend < 22.5 && !g_light) {
+			rgb = grad_apply(rgb, grp_grad_tex, world_pos, grp_grad_p0, grp_grad_p1, grp_grad_type, grp_grad_repeat, grp_grad_opacity, grp_grad_blend);
+		}
 	}
 	int cbm = int(color_blend + 0.5);
 	float lgain = light_gain;
@@ -325,60 +438,8 @@ void fragment() {
 	if (cbm > 0) {
 		vec3 d = textureLod(SCREEN_TEXTURE, SCREEN_UV, 0.0).rgb;
 		vec3 sc = rgb;
-		if (cbm == 1) {                       // Darken
-			rgb = min(d, sc);
-		} else if (cbm == 2) {                // Multiply
-			rgb = d * sc;
-		} else if (cbm == 3) {                // Color Burn
-			rgb = 1.0 - clamp((1.0 - d) / max(sc, vec3(0.004)), vec3(0.0), vec3(1.0));
-		} else if (cbm == 4) {                // Linear Burn
-			rgb = clamp(d + sc - 1.0, 0.0, 1.0);
-		} else if (cbm == 5) {                // Darker Color
-			rgb = lum3(sc) < lum3(d) ? sc : d;
-		} else if (cbm == 6) {                // Lighten
-			rgb = max(d, sc);
-		} else if (cbm == 7) {                // Screen
-			rgb = 1.0 - (1.0 - d) * (1.0 - sc);
-		} else if (cbm == 8) {                // Color Dodge
-			rgb = clamp(d / max(1.0 - sc, vec3(0.004)), vec3(0.0), vec3(1.0));
-		} else if (cbm == 9) {                // Linear Dodge (Add)
-			rgb = clamp(d + sc, 0.0, 1.0);
-		} else if (cbm == 10) {               // Lighter Color
-			rgb = lum3(sc) > lum3(d) ? sc : d;
-		} else if (cbm == 11) {               // Overlay
-			vec3 lo = 2.0 * d * sc;
-			vec3 hi = 1.0 - 2.0 * (1.0 - d) * (1.0 - sc);
-			rgb = mix(lo, hi, step(vec3(0.5), d));
-		} else if (cbm == 12) {               // Soft Light
-			vec3 lo = d - (1.0 - 2.0 * sc) * d * (1.0 - d);
-			vec3 hi = d + (2.0 * sc - 1.0) * (sqrt(d) - d);
-			rgb = mix(lo, hi, step(vec3(0.5), sc));
-		} else if (cbm == 13) {               // Hard Light
-			vec3 lo = 2.0 * d * sc;
-			vec3 hi = 1.0 - 2.0 * (1.0 - d) * (1.0 - sc);
-			rgb = mix(lo, hi, step(vec3(0.5), sc));
-		} else if (cbm == 14) {               // Vivid Light
-			vec3 lo = 1.0 - clamp((1.0 - d) / max(2.0 * sc, vec3(0.004)), vec3(0.0), vec3(1.0));
-			vec3 hi = clamp(d / max(2.0 * (1.0 - sc), vec3(0.004)), vec3(0.0), vec3(1.0));
-			rgb = mix(lo, hi, step(vec3(0.5), sc));
-		} else if (cbm == 15) {               // Linear Light
-			rgb = clamp(d + 2.0 * sc - 1.0, 0.0, 1.0);
-		} else if (cbm == 16) {               // Pin Light
-			vec3 lo = min(d, 2.0 * sc);
-			vec3 hi = max(d, 2.0 * sc - 1.0);
-			rgb = mix(lo, hi, step(vec3(0.5), sc));
-		} else if (cbm == 17) {               // Subtract
-			rgb = clamp(d - sc, 0.0, 1.0);
-		} else if (cbm == 18) {               // Inverse Subtract
-			rgb = clamp(sc - d, 0.0, 1.0);
-		} else if (cbm == 19) {               // Hue
-			rgb = set_lum(set_sat(sc, sat3(d)), lum3(d));
-		} else if (cbm == 20) {               // Saturation
-			rgb = set_lum(set_sat(d, sat3(sc)), lum3(d));
-		} else if (cbm == 21) {               // Color
-			rgb = set_lum(sc, lum3(d));
-		} else if (cbm == 22) {               // Luminosity
-			rgb = set_lum(d, lum3(sc));
+		if (cbm <= 22) {
+			rgb = blend_rgb(cbm, d, sc);
 		} else {                              // 23: painted light (our own light
 			// system, DD-style, composited at the slot's z. The brush alpha
 			// scales the ENERGY inside the exponential: each channel then
