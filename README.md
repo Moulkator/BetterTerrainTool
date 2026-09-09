@@ -1,12 +1,12 @@
 # BetterTerrainTool
 
-Better Terrain Tool (BTT) adds a layer-based terrain painter to Dungeondraft: unlimited terrain slots, real brushes, procedural generation, groups, clipping masks, light painting and colour adjustments — all saved inside your map file.
+Better Terrain Tool (BTT) adds a layer-based terrain painter to Dungeondraft: unlimited terrain slots, real brushes, procedural generation, groups, clipping masks, light painting, gradients and colour adjustments — all saved inside your map file.
 
 ---
 
 ## 1. Getting started
 <p align="center">
-<img width="293" height="200" alt="image" src="https://github.com/user-attachments/assets/94775c8d-c113-4b76-871a-788a7e222b15" />
+<img width="290" height="198" alt="image" src="https://github.com/user-attachments/assets/cbafcb51-d103-4f2a-b6d9-4ad5230e2825" />
 
 
 1. Enable the mod, open a map and pick **Better Terrain Tool** in the **Terrain** category (right after the vanilla Terrain brush).
@@ -15,7 +15,7 @@ Better Terrain Tool (BTT) adds a layer-based terrain painter to Dungeondraft: un
 
 Everything you paint is stored in the map file, so it travels with the map and survives a reload.
 
-> Tip: **Hide Vanilla Terrain** (bottom of the panel) hides Dungeondraft's own terrain layer and its tool on every level of the map, so BTT is the only terrain you see.
+> Tip: **Hide Vanilla Terrain** (bottom of the panel) hides Dungeondraft's own terrain layer and its tool on the current level, so BTT is the only terrain you see. It is saved per level. When the vanilla terrain is already disabled in its own tool, the switch reads **Hide Vanilla Terrain Brush Tool** and only hides the tool.
 
 ---
 
@@ -23,7 +23,8 @@ Everything you paint is stored in the map file, so it travels with the map and s
 
 Each row is a terrain slot: thumbnail, `z-layer: name`, blending icon and an eye.
 <p align="center">
-<img width="370" height="925" alt="image" src="https://github.com/user-attachments/assets/2c2e4195-9088-4e57-b4fd-526d23d221a6" />
+<img width="315" height="1089" alt="Screenshot3" src="https://github.com/user-attachments/assets/811b947f-1e37-455b-a9b3-f383e46f39ef" />
+
 
 
 | Action | Result |
@@ -173,7 +174,7 @@ Select several slots and press **Ctrl + G** (or right click → group submenu �
 
 - Click the group row to select the group. **Ctrl + click** it to select the member layers instead.
 - Painting on a selected group edits its **fusion mask**: right click / Alt + click carves the group out, left click restores it. **Move** moves every member and the fusion mask together.
-- The group has its own **Opacity**, **Smoothness**, **Blending** (Normal / Smooth / Hard — shapes the edge of the whole group), **Colour Settings**, **Transform**, **Light Painting** and **Clipping Mask** — independent of the members' own settings.
+- The group has its own **Opacity**, **Smoothness**, **Blending** (Normal / Smooth / Hard — shapes the edge of the whole group), **Colour Settings**, **Gradient**, **Transform**, **Light Painting** and **Clipping Mask** — independent of the members' own settings.
 - Everything else (texture, procedural generation, hide/show…) applies to every member.
 - Right click the group row: **Rename**, **Dissolve group** (keeps the layers), **Delete group (with layers)** — the latter asks for confirmation; Ctrl + Z restores everything.
 - Duplicating a grouped slot keeps the copy in the group.
@@ -213,6 +214,22 @@ Randomised per-stamp colour variation (hue / saturation / lightness ranges) so a
 
 Hue, saturation, lightness, gamma, contrast, tint (colour + amount), a blend mode against the map below, and Photoshop-style **Levels** with histogram and per-channel input/output. **Reset Colors** puts everything back. An **All** switch applies the panel to every slot.
 
+### Gradient
+
+<p align="center">
+<img width="358" height="554" alt="image" src="https://github.com/user-attachments/assets/c52d6709-7512-490d-b1d5-a4a2a3f2e87a" />
+
+
+A Photoshop-style **gradient overlay** on the slot (or the group), blended over its texture. Switch it **ON** to enable it and unfold its settings:
+
+- **Draw Gradient**: then drag on the map — press where the gradient starts, release where it ends (for *Radial*: centre and radius). The axis and its direction are shown on the map while Draw mode is on; drag again to redo it, click the button again to leave the mode. **Reset Gradient** restores the default black → white gradient.
+- The **preview bar** shows the result; **double-click** it to add a stop at that position.
+- The **stops editor** underneath: drag a stop to move it, drag the small **diamond** between two stops to move their midpoint (where the 50 % mix sits, like Photoshop), **right-click** a stop to remove it. The row below edits the selected stop: **colour with alpha**, **position %**, **midpoint %**, **+** / **−**.
+- **Type**: *Linear*, *Radial* or *Reflected* (mirrored on both sides of the start point). **Opacity %** fades the whole gradient.
+- The gradient has its **own colour settings** — blend mode (how the gradient combines with the slot's texture), gamma, contrast, hue, saturation, lightness, tint and Levels — separate from the slot's Color Settings, which do not affect it. **Reset Gradient Colors** puts them back.
+
+The gradient only changes colours, never the slot's opacity. It is saved with the map, copied with the slot (duplicate, clone, presets) and ignored in Light Painting mode.
+
 ### Transform
 
 <p align="center">
@@ -226,6 +243,7 @@ Rotation, scale and offset of the slot's texture (a group's transform composes w
 
 - **Undo / redo** works everywhere: strokes, fills, generation, layer edits, groups, clipping picks. Multi-deletes and group deletes are a single undo step.
 - **Map resize** (Map → Change Map Size): the terrain follows the map content, including cells added or removed on the left / top.
+- **Levels**: every level has its own terrain slots. **Clone Level** (New Level window) copies the source level's terrain too. On maps with several levels, **Clone terrain on:** (bottom of the panel) copies the current level's terrain onto another level (replacing that level's terrain, after confirmation). Layer presets carry textures, settings and gradients — not the paint.
 - **File size**: masks are stored as compact single-channel PNGs. The main lever remains the slot **Quality** — *High* is four times lighter than *Ultra*.
 - **Custom brushes**: grayscale PNG, white = paint. Big libraries are fine; thumbnails are built in the background.
 - If you see a "shader is outdated" warning after an update, copy the new `shaders/terrain_layer.shader` from the mod folder and restart.
