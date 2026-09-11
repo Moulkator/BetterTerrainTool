@@ -1,4 +1,4 @@
 {
 	"update_url": "https://raw.githubusercontent.com/Moulkator/BetterTerrainTool/main/BetterTerrainTool/BetterTerrainTool.ddmod",
-	"download_url": "https://github.com/Moulkator/BetterTerrainTool/releases/latest/download/BetterTerrainTool.zip"
+	"download_url": "https://github.com/Moulkator/BetterTerrainTool/releases/download/{version}/BetterTerrainTool_{version}.zip"
 }

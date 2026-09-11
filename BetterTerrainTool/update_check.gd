@@ -14,17 +14,27 @@
 #   (no API rate limit involved).
 # - The remote version is read from the mod's .ddmod file on GitHub and
 #   compared to the local .ddmod version. If at least one non-skipped update
-#   is found, a single popup lists ALL available updates with clickable
-#   download links.
+#   is found, a single popup lists ALL available updates.
+# - Clicking a mod (or "Download all") downloads the zip directly with an
+#   HTTPRequest (no browser), into the parent folder of that mod (i.e. the
+#   Mods directory, next to the folder to replace), with a progress bar.
+#   When every queued download is finished, the folder is opened in the
+#   system file explorer. If a download fails, the URL is opened in the
+#   browser as a fallback. Godot 3 cannot extract zips, so the user still
+#   has to replace the old mod folder by hand.
 #
 # PER-MOD CONFIGURATION (either option works):
 #   1) update_check.json next to the .ddmod:
 #        {
 #            "update_url":   "https://raw.githubusercontent.com/<user>/<repo>/<branch>/<path>/<Mod>.ddmod",
-#            "download_url": "https://github.com/<user>/<repo>/releases/latest/download/<Mod>.zip"
+#            "download_url": "https://github.com/<user>/<repo>/releases/download/{version}/<Mod>_{version}.zip"
 #        }
 #   2) Or the same two keys ("update_url", "download_url") added directly
 #      inside the .ddmod file.
+#   download_url placeholders, replaced at check time:
+#     {version} -> remote version read from the .ddmod on GitHub
+#     {name}    -> mod name from the .ddmod
+#   The GitHub release tag must therefore be exactly the .ddmod version.
 #
 # PERSISTENCE: user://MoulkModsUpdateChecker.json
 #   { "skipped": { "<unique_id>": "<skipped remote version>" } }
@@ -37,7 +47,7 @@
 
 # Bump this when editing this file: among all loaded copies, the highest
 # CHECKER_VERSION wins ownership of the check + popup.
-const CHECKER_VERSION := 5
+const CHECKER_VERSION := 6
 
 const META_REGISTRY := "_moulk_upd_registry"   # Dictionary: unique_id -> entry
 const META_OWNER    := "_moulk_upd_owner"      # Dictionary: {ver: int, ref: WeakRef}
@@ -71,6 +81,16 @@ var _dialog : WindowDialog = null
 var _margin : MarginContainer = null
 var _big_font : DynamicFont = null  # shared by the title and the mod links, resynced each frame
 
+# Download state (owner only, lives as long as the popup)
+var _dl_http : HTTPRequest = null
+var _dl_queue   := []       # update entries waiting to be downloaded
+var _dl_current := {}       # entry being downloaded
+var _dl_path    := ""       # local path of the file being written
+var _dl_status : Label = null
+var _dl_bar    : ProgressBar = null
+var _dl_all_btn : Button = null
+var _dl_folder_link : LinkButton = null   # clickable "Downloaded to" path
+
 
 func start() -> void:
 	if Engine.has_meta(META_DONE):
@@ -99,6 +119,7 @@ func start() -> void:
 
 func update(delta: float) -> void:
 	_fit_dialog()
+	_update_download_progress()
 	if _state == ST_DONE or _entry.empty() or Engine.has_meta(META_DONE):
 		return
 	if not _is_owner():
@@ -171,7 +192,9 @@ func _on_request_completed(result: int, response_code: int, _headers, body) -> v
 					"uid": _current["uid"],
 					"local": _current["local"],
 					"remote": remote,
-					"download": _current["download_url"],
+					"download": _resolve_download_url(String(_current["download_url"]), String(_current["name"]), remote),
+					"dir": _current["dir"],
+					"dl_state": "",   # "" | "queued" | "done" | "failed"
 				})
 		else:
 			print("[MoulkUpdateChecker] Bad .ddmod content for %s" % _current["name"])
@@ -263,8 +286,34 @@ func _build_popup() -> void:
 		lb.add_color_override("font_color", LINK_COLOR)
 		lb.add_color_override("font_color_hover", LINK_COLOR_HOVER)
 		lb.add_color_override("font_color_pressed", LINK_COLOR_HOVER)
-		lb.connect("pressed", self, "_on_mod_link_pressed", [u["download"]])
+		lb.connect("pressed", self, "_on_mod_link_pressed", [u])
 		links.add_child(lb)
+
+	# Download status + progress bar, hidden until a download starts.
+	_dl_status = Label.new()
+	_dl_status.align = Label.ALIGN_CENTER
+	_dl_status.autowrap = true
+	_dl_status.visible = false
+	vbox.add_child(_dl_status)
+
+	_dl_bar = ProgressBar.new()
+	_dl_bar.min_value = 0
+	_dl_bar.max_value = 100
+	_dl_bar.value = 0
+	_dl_bar.percent_visible = false
+	_dl_bar.rect_min_size = Vector2(0, 14)
+	_dl_bar.visible = false
+	vbox.add_child(_dl_bar)
+
+	# Clickable destination folder, shown once at least one download is done.
+	_dl_folder_link = LinkButton.new()
+	_dl_folder_link.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	_dl_folder_link.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
+	_dl_folder_link.add_color_override("font_color", LINK_COLOR)
+	_dl_folder_link.add_color_override("font_color_hover", LINK_COLOR_HOVER)
+	_dl_folder_link.add_color_override("font_color_pressed", LINK_COLOR_HOVER)
+	_dl_folder_link.visible = false
+	vbox.add_child(_dl_folder_link)
 
 	var text := RichTextLabel.new()
 	text.bbcode_enabled = true
@@ -280,6 +329,13 @@ func _build_popup() -> void:
 	var buttons := HBoxContainer.new()
 	buttons.set("custom_constants/separation", 16)
 	vbox.add_child(buttons)
+
+	_dl_all_btn = Button.new()
+	_dl_all_btn.text = "Download all" if _updates.size() > 1 else "Download"
+	_dl_all_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_dl_all_btn.connect("pressed", self, "_on_download_all_pressed")
+	_outline_button(_dl_all_btn)
+	buttons.add_child(_dl_all_btn)
 
 	var later := Button.new()
 	later.text = "Remind me later"
@@ -332,8 +388,9 @@ func _outline_button(btn: Button) -> void:
 
 func _build_bbcode() -> String:
 	var bb := "[center]"
-	bb += "Click on the mod to download the new version, then replace your old mod "
-	bb += "with the new one and restart Dungeondraft to finish the update.\n\n"
+	bb += "Click on a mod (or \"Download all\") to download the new version next to "
+	bb += "your current mod folder, then replace the old folder with the new one "
+	bb += "and restart Dungeondraft to finish the update.\n\n"
 	bb += "You can also check my other mods [url=%s]here[/url].\n\n" % LINK_GITHUB
 	bb += "Thanks for your support!"
 	bb += "[/center]\n"
@@ -345,8 +402,192 @@ func _on_meta_clicked(meta) -> void:
 	OS.shell_open(String(meta))
 
 
-func _on_mod_link_pressed(url: String) -> void:
-	OS.shell_open(url)
+func _on_mod_link_pressed(u: Dictionary) -> void:
+	_queue_download(u)
+
+
+func _on_download_all_pressed() -> void:
+	for u in _updates:
+		_queue_download(u)
+
+
+# ── Direct download ──────────────────────────────────────────────────────────
+
+func _queue_download(u: Dictionary) -> void:
+	if String(u["dl_state"]) != "" and String(u["dl_state"]) != "failed":
+		return
+	u["dl_state"] = "queued"
+	_dl_queue.append(u)
+	_dl_next()
+
+
+func _dl_next() -> void:
+	if not _dl_current.empty():
+		return  # one download at a time; called again on completion
+	if _dl_queue.empty():
+		_finish_downloads()
+		return
+	if _dialog == null or not is_instance_valid(_dialog):
+		_dl_queue = []
+		return
+	if _dl_http == null or not is_instance_valid(_dl_http):
+		# Parented to the dialog: it is already inside the tree, and the
+		# request dies with the popup.
+		_dl_http = HTTPRequest.new()
+		_dl_http.set("download_chunk_size", 65536)
+		_dl_http.set("timeout", 0)
+		_dl_http.connect("request_completed", self, "_on_download_completed")
+		_dialog.add_child(_dl_http)
+	_dl_current = _dl_queue.pop_front()
+	var url := String(_dl_current["download"])
+	var fname := url.get_file()
+	var q := fname.find("?")
+	if q >= 0:
+		fname = fname.substr(0, q)
+	if fname == "":
+		fname = "%s_%s.zip" % [_dl_current["name"], _dl_current["remote"]]
+	_dl_path = String(_dl_current["dir"]).plus_file(fname)
+	_dl_http.download_file = _dl_path
+	var err = _dl_http.request(url)
+	if err != OK:
+		print("[MoulkUpdateChecker] Download request error %d for %s" % [err, _dl_current["name"]])
+		_download_failed(url)
+		return
+	if _dl_all_btn != null and is_instance_valid(_dl_all_btn):
+		_dl_all_btn.disabled = true
+	if _dl_bar != null and is_instance_valid(_dl_bar):
+		_dl_bar.value = 0
+		_dl_bar.visible = true
+	if _dl_status != null and is_instance_valid(_dl_status):
+		_dl_status.text = "Downloading %s..." % fname
+		_dl_status.visible = true
+
+
+func _on_download_completed(result: int, response_code: int, _headers, _body) -> void:
+	var url := String(_dl_current.get("download", ""))
+	if result == HTTPRequest.RESULT_SUCCESS and response_code == 200:
+		_dl_current["dl_state"] = "done"
+		_dl_current["dl_path"] = _dl_path
+		print("[MoulkUpdateChecker] Downloaded %s" % _dl_path)
+		_dl_current = {}
+		_dl_path = ""
+		_dl_next()
+	else:
+		print("[MoulkUpdateChecker] Download failed for %s (result=%d, code=%d)" % [_dl_current["name"], result, response_code])
+		_download_failed(url)
+
+
+# Removes the partial file, marks the entry as failed and falls back to the
+# browser so the user can still get the file.
+func _download_failed(url: String) -> void:
+	_remove_partial_file()
+	_dl_current["dl_state"] = "failed"
+	if _dl_status != null and is_instance_valid(_dl_status):
+		_dl_status.text = "Download of %s failed, opening it in your browser instead." % _dl_current["name"]
+		_dl_status.visible = true
+	_dl_current = {}
+	_dl_path = ""
+	if url != "":
+		OS.shell_open(url)
+	_dl_next()
+
+
+func _remove_partial_file() -> void:
+	if _dl_path == "":
+		return
+	var d := Directory.new()
+	if d.file_exists(_dl_path):
+		d.remove(_dl_path)
+
+
+func _finish_downloads() -> void:
+	if _dl_bar != null and is_instance_valid(_dl_bar):
+		_dl_bar.visible = false
+	if _dl_all_btn != null and is_instance_valid(_dl_all_btn):
+		_dl_all_btn.disabled = false
+	# One file explorer window per destination folder, with the first zip
+	# downloaded into that folder selected.
+	var reveal := {}   # dir -> first downloaded zip path
+	var done := 0
+	for u in _updates:
+		if String(u["dl_state"]) == "done":
+			done += 1
+			if not reveal.has(u["dir"]):
+				reveal[u["dir"]] = String(u["dl_path"])
+	print("[MoulkUpdateChecker] Downloads finished: %d done, dirs=%s" % [done, String(reveal.keys())])
+	if done == 0:
+		return
+	var first_dir := String(reveal.keys()[0])
+	if _dl_status != null and is_instance_valid(_dl_status):
+		_dl_status.text = "Downloaded to:"
+		_dl_status.visible = true
+	if _dl_folder_link != null and is_instance_valid(_dl_folder_link):
+		_dl_folder_link.text = first_dir
+		if _dl_folder_link.is_connected("pressed", self, "_reveal_file"):
+			_dl_folder_link.disconnect("pressed", self, "_reveal_file")
+		_dl_folder_link.connect("pressed", self, "_reveal_file", [String(reveal[first_dir])])
+		_dl_folder_link.visible = true
+	for d in reveal:
+		_reveal_file(String(reveal[d]))
+
+
+# Opens the system file explorer on the folder containing file_path, with
+# that file selected (Windows / macOS; Linux just opens the folder).
+# OS.shell_open is not used: Dungeondraft only allows it for web URLs
+# (returns ERR_UNAUTHORIZED for local paths), so the platform file manager
+# is launched directly with OS.execute.
+# Windows: Explorer needs exactly  /select,"<path>"  on its command line,
+# but Godot 3 wraps any argument containing spaces/commas/parentheses in
+# double quotes (without escaping), which Explorer rejects. Going through
+# cmd.exe /c fixes it: Godot produces
+#     cmd.exe /c "explorer /select,"D:\path (x)\file.zip""
+# and cmd's /c rule (more than two quotes -> strip the first and the last)
+# hands Explorer the exact line  explorer /select,"D:\path (x)\file.zip".
+func _reveal_file(file_path: String) -> void:
+	var os_name := OS.get_name()
+	var cmd := ""
+	var args := []
+	if os_name == "Windows":
+		cmd = "cmd.exe"
+		args = ["/c", "explorer /select,\"%s\"" % file_path.replace("/", "\\")]
+	elif os_name == "OSX":
+		cmd = "open"
+		args = ["-R", file_path]
+	else:
+		cmd = "xdg-open"
+		args = [file_path.get_base_dir()]
+	var pid = OS.execute(cmd, args, false)
+	print("[MoulkUpdateChecker] Reveal file: %s %s -> pid %d" % [cmd, String(args), pid])
+
+
+func _update_download_progress() -> void:
+	if _dl_current.empty() or _dl_http == null or not is_instance_valid(_dl_http):
+		return
+	if _dl_status == null or not is_instance_valid(_dl_status):
+		return
+	var got := _dl_http.get_downloaded_bytes()
+	var total := _dl_http.get_body_size()
+	var fname := _dl_path.get_file()
+	if total > 0:
+		var pct := int(clamp(float(got) / float(total) * 100.0, 0.0, 100.0))
+		if _dl_bar != null and is_instance_valid(_dl_bar):
+			_dl_bar.value = pct
+		_dl_status.text = "Downloading %s... %d%% (%s / %s)" % [fname, pct, _fmt_bytes(got), _fmt_bytes(total)]
+	else:
+		_dl_status.text = "Downloading %s... %s" % [fname, _fmt_bytes(got)]
+
+
+func _fmt_bytes(n: int) -> String:
+	if n >= 1048576:
+		return "%.1f MB" % (float(n) / 1048576.0)
+	if n >= 1024:
+		return "%d KB" % int(n / 1024)
+	return "%d B" % n
+
+
+# Replaces {version} and {name} placeholders in the configured download URL.
+func _resolve_download_url(url: String, name: String, version: String) -> String:
+	return url.replace("{version}", version).replace("{name}", name)
 
 
 func _on_later_pressed() -> void:
@@ -366,6 +607,23 @@ func _on_skip_pressed() -> void:
 
 
 func _on_popup_hidden() -> void:
+	# Cancel any download in progress and drop its partial file; the
+	# HTTPRequest itself is freed with the dialog.
+	if not _dl_current.empty():
+		if _dl_http != null and is_instance_valid(_dl_http):
+			_dl_http.cancel_request()
+		_remove_partial_file()
+		_dl_current["dl_state"] = ""
+		_dl_current = {}
+		_dl_path = ""
+	for u in _dl_queue:
+		u["dl_state"] = ""
+	_dl_queue = []
+	_dl_http = null
+	_dl_status = null
+	_dl_bar = null
+	_dl_all_btn = null
+	_dl_folder_link = null
 	if _dialog != null and is_instance_valid(_dialog):
 		_dialog.queue_free()
 	_dialog = null
@@ -407,6 +665,8 @@ func _fit_dialog() -> void:
 
 # Reads name/version/unique_id from the mod's own .ddmod, plus update_url and
 # download_url either from the .ddmod itself or from update_check.json.
+# Also records the parent folder of the mod (the Mods directory) as the
+# download destination.
 func _read_local_info() -> Dictionary:
 	var ddmod_path := _find_ddmod_path()
 	if ddmod_path == "":
@@ -433,6 +693,7 @@ func _read_local_info() -> Dictionary:
 		"local": String(ddmod["version"]),
 		"update_url": update_url,
 		"download_url": download_url,
+		"dir": String(Global.Root).rstrip("/\\").get_base_dir(),
 	}
 
 
