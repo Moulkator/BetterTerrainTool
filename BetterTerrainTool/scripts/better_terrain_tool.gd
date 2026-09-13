@@ -281,6 +281,19 @@ var _smooth_linked := false
 var _blend_icons := []
 var _transform_toggle: CheckButton = null
 var _transform_box: VBoxContainer = null
+# Blur section (Gaussian strength + motion blur dial, same dial as Soft
+# Shadows' projected mode): handle direction = motion direction (screen angle,
+# 0 = right, 90 = down), handle radius (non-linear, BLUR_DIAL_EXP) = length.
+const BLUR_STRENGTH_MAX = 64.0     # world px
+const BLUR_MOTION_MAX = 256.0      # world px
+const BLUR_DIAL_EXP = 2.0
+var _blur_check: CheckButton = null
+var _blur_box: VBoxContainer = null
+var _blur_m_spin: SpinBox = null
+var _blur_a_spin: SpinBox = null
+var _blur_dial: Control = null
+var _blur_snap_btns := {}
+var _blur_syncing := false
 var _transform_open := false
 var _hide_vanilla := false     # legacy map-wide flag (maps saved before per-level Hide Vanilla)
 var _levels_eager := false     # every level of the map has been attached (see _ensure_all_levels)
@@ -1520,7 +1533,8 @@ func _new_layer(entry: Dictionary, name: String, tex_path: String, z: int, opaci
 		"dirty": true, "b64": "",
 		"hue": 0.0, "saturation": 1.0, "lightness": 0.0, "gamma": 1.0, "contrast": 1.0,
 		"tint_color": "#ffffff", "tint_amount": 0.0, "tex_rot": 0.0, "tex_scale": 1.0,
-		"tex_off_x": 0.0, "tex_off_y": 0.0, "blend": 0, "smoothness": 1536.0, "color_blend": 0,
+		"tex_off_x": 0.0, "tex_off_y": 0.0, "tex_blur_on": false, "tex_blur": 0.0, "tex_mblur": 0.0, "tex_mblur_a": 0.0,
+		"blend": 0, "smoothness": 1536.0, "color_blend": 0,
 		"levels": {"on": false, "m": [0.0, 1.0, 1.0, 0.0, 1.0], "r": [0.0, 1.0, 1.0, 0.0, 1.0], "g": [0.0, 1.0, 1.0, 0.0, 1.0], "b": [0.0, 1.0, 1.0, 0.0, 1.0]},
 		"blur_tex": null, "blur_small": null, "blur_f": 0,
 		"light_paint": false, "light_intensity": 1.0, "light_node": null,
@@ -1568,9 +1582,10 @@ func _build_layer_node(entry: Dictionary, layer: Dictionary) -> void:
 	_apply_color_params(layer, mat)
 
 
-const COLOR_KEYS = ["hue", "saturation", "lightness", "gamma", "contrast", "tint_color", "tint_amount", "tex_rot", "tex_scale", "tex_off_x", "tex_off_y", "blend", "smoothness", "color_blend", "levels"]
+const COLOR_KEYS = ["hue", "saturation", "lightness", "gamma", "contrast", "tint_color", "tint_amount", "tex_rot", "tex_scale", "tex_off_x", "tex_off_y", "tex_blur_on", "tex_blur", "tex_mblur", "tex_mblur_a", "blend", "smoothness", "color_blend", "levels"]
 const COLOR_DEFAULTS = {"hue": 0.0, "saturation": 1.0, "lightness": 0.0, "gamma": 1.0, "contrast": 1.0,
-	"tint_color": "#ffffff", "tint_amount": 0.0, "tex_rot": 0.0, "tex_scale": 1.0, "tex_off_x": 0.0, "tex_off_y": 0.0, "blend": 0, "smoothness": 1536.0, "color_blend": 0,
+	"tint_color": "#ffffff", "tint_amount": 0.0, "tex_rot": 0.0, "tex_scale": 1.0, "tex_off_x": 0.0, "tex_off_y": 0.0,
+	"tex_blur_on": false, "tex_blur": 0.0, "tex_mblur": 0.0, "tex_mblur_a": 0.0, "blend": 0, "smoothness": 1536.0, "color_blend": 0,
 	"levels": {"on": false, "m": [0.0, 1.0, 1.0, 0.0, 1.0], "r": [0.0, 1.0, 1.0, 0.0, 1.0], "g": [0.0, 1.0, 1.0, 0.0, 1.0], "b": [0.0, 1.0, 1.0, 0.0, 1.0]}}
 
 
@@ -1599,6 +1614,10 @@ func _apply_color_params(layer: Dictionary, mat: ShaderMaterial) -> void:
 	mat.set_shader_param("tex_rot", deg2rad(float(layer["tex_rot"])))
 	mat.set_shader_param("tex_scale", float(layer["tex_scale"]))
 	mat.set_shader_param("tex_offset", Vector2(float(layer["tex_off_x"]), float(layer["tex_off_y"])))
+	mat.set_shader_param("tex_blur_on", 1.0 if bool(layer.get("tex_blur_on", false)) else 0.0)
+	mat.set_shader_param("tex_blur", float(layer.get("tex_blur", 0.0)))
+	mat.set_shader_param("tex_mblur", float(layer.get("tex_mblur", 0.0)))
+	mat.set_shader_param("tex_mblur_a", deg2rad(float(layer.get("tex_mblur_a", 0.0))))
 	mat.set_shader_param("blend_mode", float(int(layer["blend"])))
 	mat.set_shader_param("color_blend", float(int(layer["color_blend"])))
 	var lv = layer["levels"]
@@ -2110,7 +2129,7 @@ func _grad_of(t: Dictionary) -> Dictionary:
 		if not gd.has(k):
 			gd[k] = _cv(GRAD_DEFAULTS[k])
 	for k in COLOR_DEFAULTS.keys():
-		if k in ["tex_rot", "tex_scale", "tex_off_x", "tex_off_y"]:
+		if k in ["tex_rot", "tex_scale", "tex_off_x", "tex_off_y", "tex_blur_on", "tex_blur", "tex_mblur", "tex_mblur_a"]:
 			continue
 		if not gd.has(k):
 			gd[k] = _cv(COLOR_DEFAULTS[k])
@@ -2332,7 +2351,7 @@ func _build_shader() -> void:
 	if f.open(_root + "shaders/terrain_layer.shader", File.READ) == OK:
 		_shader.code = f.get_as_text()
 		f.close()
-		_shader_outdated = not ("BTT_GRP_V4" in _shader.code)
+		_shader_outdated = not ("BTT_GRP_V5" in _shader.code)
 		if _shader_outdated:
 			printerr("[BetterTerrain] shaders/terrain_layer.shader is OUTDATED. Layer groups will not render -- copy the shader file shipped with this version of the mod.")
 	else:
@@ -2359,7 +2378,8 @@ func _load_texture(path):
 		var img = Image.new()
 		if img.load(path) == OK:
 			var it = ImageTexture.new()
-			it.create_from_image(img, Texture.FLAG_REPEAT | Texture.FLAG_FILTER)
+			# Mipmaps: the Blur setting reads coarser levels for large radii.
+			it.create_from_image(img, Texture.FLAG_REPEAT | Texture.FLAG_FILTER | Texture.FLAG_MIPMAPS)
 			t = it
 	if t == null:
 		print("[BetterTerrain] Could not load texture: ", path)
@@ -2369,8 +2389,33 @@ func _load_texture(path):
 		var ft = ImageTexture.new()
 		ft.create_from_image(img2, Texture.FLAG_REPEAT | Texture.FLAG_FILTER)
 		t = ft
+	t = _ensure_mipmaps(t)
 	_tex_cache[path] = t
 	return t
+
+
+# The Blur setting samples coarser mip levels for large radii; a texture
+# without a mip chain (DD's own textures, or a loaded PNG) would fall back to
+# level 0 and show the tap grid. Returns a mipmapped copy (REPEAT | FILTER)
+# when needed -- cached per path by _load_texture, so it is built once.
+func _ensure_mipmaps(t):
+	if t == null or not (t is Texture):
+		return t
+	if (t.flags & Texture.FLAG_MIPMAPS) != 0 and (t.flags & Texture.FLAG_REPEAT) != 0:
+		return t
+	var img = t.get_data()
+	if img == null or img.is_empty():
+		return t
+	img = img.duplicate()
+	if img.is_compressed():
+		if img.decompress() != OK:
+			return t
+	if img.get_format() != Image.FORMAT_RGBA8:
+		img.convert(Image.FORMAT_RGBA8)
+	img.generate_mipmaps()
+	var mt = ImageTexture.new()
+	mt.create_from_image(img, Texture.FLAG_REPEAT | Texture.FLAG_FILTER | Texture.FLAG_MIPMAPS)
+	return mt
 
 
 func _display_name(path) -> String:
@@ -4962,6 +5007,8 @@ func _persist() -> void:
 				"tint_color": str(layer["tint_color"]), "tint_amount": float(layer["tint_amount"]),
 				"tex_rot": float(layer["tex_rot"]), "tex_scale": float(layer["tex_scale"]),
 				"tex_off_x": float(layer["tex_off_x"]), "tex_off_y": float(layer["tex_off_y"]), "blend": int(layer["blend"]),
+				"tex_blur_on": bool(layer.get("tex_blur_on", false)), "tex_blur": float(layer.get("tex_blur", 0.0)),
+				"tex_mblur": float(layer.get("tex_mblur", 0.0)), "tex_mblur_a": float(layer.get("tex_mblur_a", 0.0)),
 				"smoothness": float(layer["smoothness"]), "color_blend": int(layer["color_blend"]),
 				"levels": _cv(layer["levels"]),
 				"light_paint": bool(layer.get("light_paint", false)),
@@ -5341,14 +5388,14 @@ func _register_tool() -> void:
 	ogr3.add_child(_reset_btn("_on_slider_reset", [_og_cov_slider, 55]))
 	_organic_box.add_child(ogr3)
 	_og_post_slider = _mk_slider(0, 100, 1, 55, "_on_post_cov_slider")
-	_og_post_slider.hint_tooltip = "Re-threshold the generated noise of the selected layer(s) at another coverage (same blobs, applied on release)."
+	_og_post_slider.hint_tooltip = "Adjusts the coverage of the generated layer(s): same blobs, re-thresholded at another percentage (applied on release)."
 	# Applied on release: through drag_ended when the engine build has it,
 	# and through the slider's own mouse release otherwise.
 	if _og_post_slider.has_signal("drag_ended"):
 		_og_post_slider.connect("drag_ended", self, "_on_post_cov_drag_ended")
 	_og_post_slider.connect("gui_input", self, "_on_post_cov_gui_input")
 	_og_post_spin = _mk_spin(0, 100, 1, 55, "_on_post_cov_spin")
-	_og_post_row = _labeled("Coverage %", _og_post_slider)
+	_og_post_row = _labeled("Adjust %", _og_post_slider)
 	_og_post_row.add_child(_og_post_spin)
 	_og_post_row.visible = false
 	_props_top.add_child(row2)
@@ -5481,6 +5528,25 @@ func _register_tool() -> void:
 	_transform_box.add_child(_cs.param_row("Scale", "tex_scale", 0.25, 4, 0.01, 1))
 	_transform_box.add_child(_cs.param_row("Offset X", "tex_off_x", -512, 512, 1, 0))
 	_transform_box.add_child(_cs.param_row("Offset Y", "tex_off_y", -512, 512, 1, 0))
+	_props_box.add_child(_sep())
+	# ── Blur (Gaussian strength + motion dial), per layer ──
+	_blur_check = CheckButton.new()
+	_blur_check.text = "Blur"
+	_blur_check.align = Button.ALIGN_CENTER
+	var bl_ic = _load_icon(_root + "icons/blur.png")
+	if bl_ic != null:
+		_blur_check.icon = bl_ic
+	_blur_check.hint_tooltip = "Blurs the layer's texture: Gaussian strength, plus a motion blur set with the dial (direction = handle, length = radius)."
+	_blur_check.connect("toggled", self, "_on_blur_toggled")
+	# Chevron instead of the switch graphics (like Transform); the button
+	# still carries the layer's ON/OFF state: ON enables the blur AND unfolds.
+	_attach_chevron(_blur_check, false)
+	_props_box.add_child(_blur_check)
+	_blur_box = VBoxContainer.new()
+	_blur_box.visible = false
+	_blur_box.add_child(_cs.param_row("Strength", "tex_blur", 0, BLUR_STRENGTH_MAX, 0.5, 0))
+	_blur_box.add_child(_build_blur_motion_widget())
+	_props_box.add_child(_blur_box)
 	_props_box.add_child(_sep())
 	_hide_vanilla_check = CheckButton.new()
 	_hide_vanilla_check.text = "Hide Vanilla Terrain"
@@ -8602,6 +8668,341 @@ func _on_light_paint_toggled(on: bool) -> void:
 	_persist()
 
 
+# ── Blur section ───────────────────────────────────────────────────────────
+
+func _sync_blur_ui(layer, grp) -> void:
+	if _blur_check == null or not is_instance_valid(_blur_check):
+		return
+	# Per layer only: a group has no blur of its own (its members keep theirs).
+	var show = layer != null and grp == null
+	_blur_check.visible = show
+	if not show:
+		_blur_box.visible = false
+		return
+	var on = bool(layer.get("tex_blur_on", false))
+	_blur_syncing = true
+	if _blur_check.pressed != on:
+		_blur_check.pressed = on
+	_blur_box.visible = on
+	var chv = _blur_check.get_node_or_null("chev")
+	if chv != null:
+		chv.flip_v = on
+	var m = float(layer.get("tex_mblur", 0.0))
+	var a = float(layer.get("tex_mblur_a", 0.0))
+	if _blur_m_spin != null and is_instance_valid(_blur_m_spin) and abs(_blur_m_spin.value - m) > 0.001:
+		_blur_m_spin.value = m
+	if _blur_a_spin != null and is_instance_valid(_blur_a_spin) and abs(_blur_a_spin.value - a) > 0.001:
+		_blur_a_spin.value = a
+	_blur_syncing = false
+	_blur_sync_dial(m, a)
+
+
+func _on_blur_toggled(on: bool) -> void:
+	if _blur_box != null and is_instance_valid(_blur_box):
+		_blur_box.visible = on
+	var chv = _blur_check.get_node_or_null("chev")
+	if chv != null:
+		chv.flip_v = on
+	if _blur_syncing or _ui_syncing:
+		return
+	_cs.set_param("tex_blur_on", on)
+
+
+func _build_blur_motion_widget() -> Control:
+	var box = VBoxContainer.new()
+	var title = Label.new()
+	title.text = "Motion Blur"
+	box.add_child(title)
+	var header = HBoxContainer.new()
+	var mlbl = Label.new()
+	mlbl.text = "Length"
+	header.add_child(mlbl)
+	var mspin = SpinBox.new()
+	mspin.min_value = 0
+	mspin.max_value = BLUR_MOTION_MAX
+	mspin.step = 0.5
+	mspin.value = 0
+	mspin.suffix = "px"
+	mspin.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	mspin.rect_min_size.x = 72
+	mspin.connect("value_changed", self, "_on_blur_m_changed")
+	header.add_child(mspin)
+	header.add_child(_reset_btn("_on_blur_reset", ["m"]))
+	var albl = Label.new()
+	albl.text = "Angle"
+	header.add_child(albl)
+	var aspin = SpinBox.new()
+	aspin.min_value = 0
+	aspin.max_value = 359
+	aspin.step = 1
+	aspin.value = 0
+	aspin.suffix = "°"
+	aspin.allow_greater = false
+	aspin.allow_lesser = false
+	aspin.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	aspin.rect_min_size.x = 60
+	aspin.connect("value_changed", self, "_on_blur_a_changed")
+	header.add_child(aspin)
+	header.add_child(_reset_btn("_on_blur_reset", ["a"]))
+	box.add_child(header)
+	var dial_container = CenterContainer.new()
+	dial_container.rect_clip_content = false
+	var dial_margin = MarginContainer.new()
+	dial_margin.rect_clip_content = false
+	for side in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
+		dial_margin.add_constant_override(side, 8)
+	var dial = _make_blur_dial(90)
+	dial_margin.add_child(dial)
+	dial_container.add_child(dial_margin)
+	box.add_child(dial_container)
+	_blur_m_spin = mspin
+	_blur_a_spin = aspin
+	_blur_dial = dial
+	return box
+
+
+func _make_blur_dial(dial_size: int) -> Control:
+	# Concentric rings, diagonal guides, crosshair, handle and four corner
+	# snap buttons (angle locks). Handle = motion direction, radius = length.
+	var dial = Control.new()
+	dial.name = "BlurDial"
+	dial.rect_min_size = Vector2(dial_size, dial_size)
+	dial.rect_size = Vector2(dial_size, dial_size)
+	var bg_sprite = TextureRect.new()
+	bg_sprite.texture = _blur_circle_texture(dial_size, Color(0.12, 0.12, 0.12, 1.0))
+	bg_sprite.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dial.add_child(bg_sprite)
+	for ring_frac in [0.25, 0.5, 0.75]:
+		var ring_size = int(dial_size * ring_frac)
+		var ring_rect = TextureRect.new()
+		ring_rect.texture = _blur_ring_texture(ring_size, Color(0.22, 0.22, 0.22, 1.0))
+		ring_rect.rect_position = Vector2((dial_size - ring_size) / 2.0, (dial_size - ring_size) / 2.0)
+		ring_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		dial.add_child(ring_rect)
+	for diag_angle in [45.0, 135.0, 225.0, 315.0]:
+		var diag_rad = deg2rad(diag_angle)
+		var dx = cos(diag_rad)
+		var dy = sin(diag_rad)
+		var line_len = dial_size / 2.0 - 2.0
+		for sd in range(4, int(line_len), 3):
+			var dot_line = ColorRect.new()
+			dot_line.color = Color(0.20, 0.20, 0.20, 0.5)
+			dot_line.rect_min_size = Vector2(1, 1)
+			dot_line.rect_position = Vector2(dial_size / 2.0 + dx * sd, dial_size / 2.0 + dy * sd)
+			dot_line.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			dial.add_child(dot_line)
+	var h_line = ColorRect.new()
+	h_line.color = Color(0.25, 0.25, 0.25, 0.6)
+	h_line.rect_position = Vector2(0, dial_size / 2.0 - 0.5)
+	h_line.rect_min_size = Vector2(dial_size, 1)
+	h_line.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dial.add_child(h_line)
+	var v_line = ColorRect.new()
+	v_line.color = Color(0.25, 0.25, 0.25, 0.6)
+	v_line.rect_position = Vector2(dial_size / 2.0 - 0.5, 0)
+	v_line.rect_min_size = Vector2(1, dial_size)
+	v_line.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dial.add_child(v_line)
+	var center_dot = ColorRect.new()
+	center_dot.color = Color(0.4, 0.4, 0.4, 1.0)
+	center_dot.rect_min_size = Vector2(3, 3)
+	center_dot.rect_position = Vector2(dial_size / 2.0 - 1.5, dial_size / 2.0 - 1.5)
+	center_dot.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dial.add_child(center_dot)
+	var handle = ColorRect.new()
+	handle.name = "Handle"
+	handle.color = Color(0.95, 0.6, 0.1, 1.0)
+	handle.rect_min_size = Vector2(10, 10)
+	handle.rect_position = Vector2(dial_size / 2.0 - 5, dial_size / 2.0 - 5)
+	handle.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dial.add_child(handle)
+	var snap_btn_size = 12
+	var snap_positions = {
+		"snap_315": Vector2(dial_size - 8, -4),
+		"snap_45":  Vector2(dial_size - 8, dial_size - 8),
+		"snap_135": Vector2(-4, dial_size - 8),
+		"snap_225": Vector2(-4, -4),
+	}
+	var snap_angles = {"snap_315": 315.0, "snap_45": 45.0, "snap_135": 135.0, "snap_225": 225.0}
+	var snap_tooltips = {"snap_315": "Lock angle: up-right", "snap_45": "Lock angle: down-right",
+		"snap_135": "Lock angle: down-left", "snap_225": "Lock angle: up-left"}
+	_blur_snap_btns = {}
+	for key in snap_positions.keys():
+		var snap_btn = TextureButton.new()
+		snap_btn.name = key
+		snap_btn.texture_normal = _blur_circle_texture(snap_btn_size, Color(0.3, 0.3, 0.3, 0.8))
+		snap_btn.texture_pressed = _blur_circle_texture(snap_btn_size, Color(0.353, 0.698, 1.0, 1.0))
+		snap_btn.toggle_mode = true
+		snap_btn.pressed = false
+		snap_btn.rect_position = snap_positions[key]
+		snap_btn.rect_min_size = Vector2(snap_btn_size, snap_btn_size)
+		snap_btn.hint_tooltip = snap_tooltips[key]
+		snap_btn.connect("toggled", self, "_on_blur_snap_toggled", [key, snap_angles[key]])
+		dial.add_child(snap_btn)
+		_blur_snap_btns[key] = snap_btn
+	dial.set_meta("dial_size", dial_size)
+	dial.set_meta("dragging", false)
+	dial.set_meta("snap_angle", -1.0)
+	dial.rect_clip_content = false
+	dial.connect("gui_input", self, "_on_blur_dial_input", [dial])
+	return dial
+
+
+func _blur_circle_texture(size: int, color: Color) -> ImageTexture:
+	var img = Image.new()
+	img.create(size, size, false, Image.FORMAT_RGBA8)
+	img.lock()
+	var center = Vector2(size / 2.0, size / 2.0)
+	var radius = size / 2.0
+	for y in range(size):
+		for x in range(size):
+			img.set_pixel(x, y, color if Vector2(x, y).distance_to(center) <= radius else Color(0, 0, 0, 0))
+	img.unlock()
+	var tex = ImageTexture.new()
+	tex.create_from_image(img, 0)
+	return tex
+
+
+func _blur_ring_texture(size: int, color: Color) -> ImageTexture:
+	var img = Image.new()
+	img.create(size, size, false, Image.FORMAT_RGBA8)
+	img.lock()
+	var center = Vector2(size / 2.0, size / 2.0)
+	var radius = size / 2.0
+	for y in range(size):
+		for x in range(size):
+			img.set_pixel(x, y, color if abs(Vector2(x, y).distance_to(center) - radius) < 1.0 else Color(0, 0, 0, 0))
+	img.unlock()
+	var tex = ImageTexture.new()
+	tex.create_from_image(img, 0)
+	return tex
+
+
+func _blur_len_from_frac(frac: float) -> float:
+	return pow(clamp(frac, 0.0, 1.0), BLUR_DIAL_EXP) * BLUR_MOTION_MAX
+
+
+func _blur_frac_from_len(length: float) -> float:
+	return pow(clamp(length / BLUR_MOTION_MAX, 0.0, 1.0), 1.0 / BLUR_DIAL_EXP)
+
+
+func _blur_set_dial_handle(v: Vector2) -> void:
+	if _blur_dial == null or not is_instance_valid(_blur_dial):
+		return
+	var dial_size = float(_blur_dial.get_meta("dial_size"))
+	var radius = dial_size / 2.0
+	var handle = _blur_dial.get_node_or_null("Handle")
+	if handle == null:
+		return
+	handle.rect_position = Vector2(dial_size / 2.0 + v.x * radius - 5, dial_size / 2.0 + v.y * radius - 5)
+
+
+func _blur_sync_dial(m: float, a: float) -> void:
+	var frac = _blur_frac_from_len(m)
+	var rad = deg2rad(a)
+	_blur_set_dial_handle(Vector2(cos(rad), sin(rad)) * frac)
+
+
+func _blur_push(m: float, a: float) -> void:
+	# Writes both motion keys through the colour-settings pipeline (edit
+	# targets, material update, persistence) and mirrors the controls.
+	_blur_syncing = true
+	if _blur_m_spin != null and abs(_blur_m_spin.value - m) > 0.001:
+		_blur_m_spin.value = m
+	if _blur_a_spin != null and abs(_blur_a_spin.value - a) > 0.001:
+		_blur_a_spin.value = a
+	_blur_syncing = false
+	_blur_sync_dial(m, a)
+	_cs.set_param("tex_mblur", m)
+	_cs.set_param("tex_mblur_a", a)
+
+
+func _on_blur_m_changed(v: float) -> void:
+	if _blur_syncing or _ui_syncing:
+		return
+	_blur_push(float(v), float(_blur_a_spin.value))
+
+
+func _on_blur_a_changed(v: float) -> void:
+	if _blur_syncing or _ui_syncing:
+		return
+	var snap = float(_blur_dial.get_meta("snap_angle")) if (_blur_dial != null and is_instance_valid(_blur_dial)) else -1.0
+	if snap >= 0.0:
+		# Angle locked by a snap button: revert manual edits.
+		_blur_syncing = true
+		_blur_a_spin.value = round(snap)
+		_blur_syncing = false
+		return
+	_blur_push(float(_blur_m_spin.value), float(v))
+
+
+func _on_blur_reset(which: String) -> void:
+	if which == "m":
+		_blur_push(0.0, float(_blur_a_spin.value))
+	else:
+		_blur_deactivate_snaps()
+		_blur_push(float(_blur_m_spin.value), 0.0)
+
+
+func _on_blur_dial_input(event: InputEvent, dial: Control) -> void:
+	if event is InputEventMouseButton:
+		if event.button_index == BUTTON_LEFT:
+			dial.set_meta("dragging", event.pressed)
+			if event.pressed:
+				_blur_update_dial_from_mouse(event.position, dial)
+	elif event is InputEventMouseMotion:
+		if dial.get_meta("dragging"):
+			_blur_update_dial_from_mouse(event.position, dial)
+
+
+func _blur_update_dial_from_mouse(pos: Vector2, dial: Control) -> void:
+	var dial_size = float(dial.get_meta("dial_size"))
+	var radius = dial_size / 2.0
+	var delta = pos - Vector2(radius, radius)
+	if delta.length() > radius:
+		delta = delta.normalized() * radius
+	var length = stepify(_blur_len_from_frac(delta.length() / radius), 0.5)
+	var snap = float(dial.get_meta("snap_angle"))
+	var ang = float(_blur_a_spin.value)
+	if snap >= 0.0:
+		ang = snap   # locked: dragging only changes the length
+	elif delta.length() > 0.5:
+		ang = rad2deg(atan2(delta.y, delta.x))
+		if ang < 0.0:
+			ang += 360.0
+		ang = round(ang)
+	_blur_push(length, ang)
+	if snap < 0.0:
+		_blur_set_dial_handle(delta / radius)   # free handle (not re-quantised)
+
+
+func _on_blur_snap_toggled(pressed: bool, key: String, angle: float) -> void:
+	if _blur_syncing:
+		return
+	if pressed:
+		_blur_syncing = true
+		for k in _blur_snap_btns.keys():
+			if k != key and is_instance_valid(_blur_snap_btns[k]):
+				_blur_snap_btns[k].pressed = false
+		_blur_syncing = false
+		if _blur_dial != null and is_instance_valid(_blur_dial):
+			_blur_dial.set_meta("snap_angle", angle)
+		_blur_push(float(_blur_m_spin.value), angle)
+	elif _blur_dial != null and is_instance_valid(_blur_dial):
+		_blur_dial.set_meta("snap_angle", -1.0)
+
+
+func _blur_deactivate_snaps() -> void:
+	var prev = _blur_syncing
+	_blur_syncing = true
+	for k in _blur_snap_btns.keys():
+		if is_instance_valid(_blur_snap_btns[k]):
+			_blur_snap_btns[k].pressed = false
+	_blur_syncing = prev
+	if _blur_dial != null and is_instance_valid(_blur_dial):
+		_blur_dial.set_meta("snap_angle", -1.0)
+
+
 func _on_light_intensity_changed(v: float) -> void:
 	if _ui_syncing:
 		return
@@ -8715,6 +9116,7 @@ func _sync_props() -> void:
 		_ui_syncing = false
 	if _cs != null:
 		_cs.sync_ui()
+	_sync_blur_ui(layer, grp)
 	if _use_plain_check != null and is_instance_valid(_use_plain_check):
 		var plain = str(layer["tex"]).begins_with("color://")
 		if _use_plain_check.pressed != plain:

@@ -1,3 +1,9 @@
+BETTER TERRAIN TOOL
+
+v1.1.1
+- Added Gaussian Blur and Motion Blur
+- Renamed "Coverage %" to "Adjust %"
+
 v1.1.0
 - New feature: Gradients
 - New feature: Clone terrain to selected level (the button appears at the bottom of the left menu when there's more than one level)

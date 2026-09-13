@@ -80,6 +80,13 @@ func param_row(label: String, key: String, mn, mx, st, val) -> HBoxContainer:
 	return _color_row(label, key, mn, mx, st, val)
 
 
+# Public alias: writes a target key through the regular pipeline (edit
+# targets, cs_apply, cs_edited). For host-built controls (toggles, dials)
+# that are not slider rows.
+func set_param(key: String, v) -> void:
+	_set_color_param(key, v)
+
+
 func build(box: VBoxContainer) -> void:
 	if gradient:
 		_build_gradient_variant(box)

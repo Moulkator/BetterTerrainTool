@@ -1,6 +1,6 @@
 shader_type canvas_item;
 render_mode blend_mix;
-// BTT_GRP_V4 -- version marker checked by better_terrain_tool.gd at boot.
+// BTT_GRP_V5 -- version marker checked by better_terrain_tool.gd at boot.
 
 uniform sampler2D tile;
 uniform sampler2D mask;
@@ -17,6 +17,10 @@ uniform vec4 tint = vec4(1.0, 1.0, 1.0, 0.0);   // rgb + amount
 uniform float tex_rot = 0.0;                    // radians
 uniform float tex_scale = 1.0;
 uniform vec2 tex_offset = vec2(0.0, 0.0);       // world px
+uniform float tex_blur_on = 0.0;                // Blur section enabled
+uniform float tex_blur = 0.0;                   // Gaussian blur strength (world px)
+uniform float tex_mblur = 0.0;                  // motion blur length (world px)
+uniform float tex_mblur_a = 0.0;                // motion angle, radians, world space (0 right, 90 down)
 uniform float blend_mode = 0.0;                 // 0 normal, 1 smooth (wide blur), 2 hard (height map)
 uniform float color_blend = 0.0;                // index in the blend-mode list (see CB_NAMES)
 uniform float lv_on = 0.0;                      // Photoshop-style Levels (per channel + master)
@@ -115,6 +119,94 @@ vec3 hsv2rgb(vec3 c) {
 	vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
 	vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
 	return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+// Cubic B-spline reconstruction of a mip level with 4 bilinear fetches
+// (GPU Gems 2, ch. 20). Bilinear alone is piecewise-linear: with coarse
+// texels the kinks at texel edges show as a faint grid through the blur.
+vec4 tile_cubic(vec2 uv, float lod) {
+	vec2 ts = max(tile_size / exp2(lod), vec2(1.0));
+	vec2 tc = uv * ts - 0.5;
+	vec2 f = fract(tc);
+	tc -= f;
+	vec2 f2 = f * f;
+	vec2 f3 = f2 * f;
+	vec2 w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+	vec2 w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+	vec2 w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0;
+	vec2 w3 = f3 / 6.0;
+	vec2 s0 = w0 + w1;
+	vec2 s1 = w2 + w3;
+	vec2 t0 = (tc - 1.0 + w1 / s0 + 0.5) / ts;
+	vec2 t1 = (tc + 1.0 + w3 / s1 + 0.5) / ts;
+	return (textureLod(tile, vec2(t0.x, t0.y), lod) * s0.x + textureLod(tile, vec2(t1.x, t0.y), lod) * s1.x) * s0.y
+		+ (textureLod(tile, vec2(t0.x, t1.y), lod) * s0.x + textureLod(tile, vec2(t1.x, t1.y), lod) * s1.x) * s1.y;
+}
+
+// One premultiplied tap: cubic on coarse levels, plain bilinear at lod 0
+// (1 px texels: the kinks are invisible, no point paying 4 fetches).
+vec4 tile_tap(vec2 uv, float lod) {
+	vec4 t = (lod > 0.5) ? tile_cubic(uv, lod) : textureLod(tile, uv, 0.0);
+	return vec4(t.rgb * t.a, t.a);
+}
+
+// Blur of the tile texture: Gaussian (radius r, sigma r/2) and/or motion
+// (length m along `ax`, softened box profile ~ box convolved with the
+// Gaussian). Tap spacing = an exact power of two = the texel size of the
+// mip level read (integer lod): the reconstruction kernels of neighbouring
+// taps sum to a flat response, so no ripple / moire whatever the radius,
+// and the tile repeats seamlessly since the taps wrap with the sampler.
+// r, m and `ax` are in TEXTURE px / texture space (the caller converts
+// from world px and world direction). Premultiplied accumulation keeps
+// transparent texels (patterns) from darkening the edges.
+vec4 tile_sample(vec2 tuv, float r, float m, vec2 ax) {
+	if (tex_blur_on < 0.5 || (r < 0.05 && m < 0.05)) {
+		return texture(tile, tuv);
+	}
+	vec2 ps = 1.0 / tile_size;
+	vec2 ay = vec2(-ax.y, ax.x);
+	float sig = max(r * 0.5, 0.35);
+	float s2 = 2.0 * sig * sig;
+	vec4 acc = vec4(0.0);
+	float ws = 0.0;
+	if (m < 0.05) {
+		float sp = exp2(ceil(log2(max(r / 7.0, 1.0))));
+		float lod = log2(sp);
+		int n = int(min(ceil(r / sp), 7.0));
+		for (int i = -7; i <= 7; i++) {
+			if (i < -n || i > n) continue;
+			for (int j = -7; j <= 7; j++) {
+				if (j < -n || j > n) continue;
+				vec2 o = vec2(float(i), float(j)) * sp;
+				float w = exp(-dot(o, o) / s2);
+				acc += tile_tap(tuv + o * ps, lod) * w;
+				ws += w;
+			}
+		}
+	} else {
+		float hm = m * 0.5;
+		float ea = hm + 2.0 * sig;
+		float sp = exp2(ceil(log2(max(max(ea / 10.0, r / 5.0), 1.0))));
+		float lod = log2(sp);
+		int na = int(min(ceil(ea / sp), 10.0));
+		int nc = int(min(ceil(r / sp), 5.0));
+		for (int i = -10; i <= 10; i++) {
+			if (i < -na || i > na) continue;
+			float x = float(i) * sp;
+			float wa = smoothstep(-hm - 2.0 * sig, -hm + 2.0 * sig, x) * (1.0 - smoothstep(hm - 2.0 * sig, hm + 2.0 * sig, x));
+			for (int j = -5; j <= 5; j++) {
+				if (j < -nc || j > nc) continue;
+				float y = float(j) * sp;
+				float w = wa * exp(-y * y / s2);
+				acc += tile_tap(tuv + (ax * x + ay * y) * ps, lod) * w;
+				ws += w;
+			}
+		}
+	}
+	if (ws <= 0.0 || acc.a <= 0.0) {
+		return vec4(0.0);
+	}
+	return vec4(acc.rgb / acc.a, acc.a / ws);
 }
 
 void vertex() {
@@ -266,7 +358,12 @@ void fragment() {
 	float cs = cos(tex_rot + g_rot);
 	float sn = sin(tex_rot + g_rot);
 	uv = vec2(uv.x * cs - uv.y * sn, uv.x * sn + uv.y * cs);
-	vec4 c = texture(tile, uv / (tile_size * max(tex_scale * g_scl, 0.01)));
+	float tscl = max(tex_scale * g_scl, 0.01);
+	// Blur amounts are world px -> texture px; the motion direction is a
+	// world direction, rotated into the tile's (rotated) texture space.
+	vec2 mdw = vec2(cos(tex_mblur_a), sin(tex_mblur_a));
+	vec2 mdt = vec2(mdw.x * cs - mdw.y * sn, mdw.x * sn + mdw.y * cs);
+	vec4 c = tile_sample(uv / (tile_size * tscl), tex_blur / tscl, tex_mblur / tscl, mdt);
 	if (bm > 1.5) {
 		// Hard: the texture's alpha acts as a height map.
 		m = clamp(smoothstep(0.35, 0.65, m + (c.a - 0.5) * 0.6), 0.0, 1.0) * step(0.003, m);
